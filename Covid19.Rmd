@@ -12,7 +12,7 @@ knitr::opts_chunk$set(echo = TRUE)
 # Libraries and  Raw Data
 ```{r lib, message=FALSE, warning=FALSE}
 library(googleVis)
-op <- options(gvis.plot.tag='chart')
+#op <- options(gvis.plot.tag='chart')
 library(lubridate)
 library(fpp3)
 library(tidyverse)
@@ -31,34 +31,51 @@ library(GGally)
 library(corrplot)
 library(ggthemes)
 library(zoo)
+library(anomalize)
 library(tidycovid19)
 
 theme_set(theme_minimal())
 
-train <- read_csv("train.csv") %>%
-  rename(state = Province_State,
-         country = Country_Region)
 
-test <- read_csv("test.csv") %>%
-         rename(state = Province_State,
-         country = Country_Region)
 
-train <- train %>% 
-         mutate(country_id = case_when(is.na(state) ~ country,
-                                TRUE ~ paste0(country, "_", state)))
+covid <- read_csv("data/covid19.csv")
+
+#download new data if available
+if(max(covid$date) < today() -days(1) ){
+
+  covid_new <- tidycovid19::download_jhu_csse_covid19_data()
+  
+  #additional check
+  if(nrow(covid_new) > nrow(covid)){
+  covid <- covid_new
+  rm(covid_new)
+  write_csv(covid, "data/covid19.csv")
+  }
+}
+
+paste0("period covered: ", min(covid$date), " - ", max(covid$date)) %>% print()
+
+#Goal to predict last two weeks
+period <- 14
+
+train <- covid %>% filter(date <= max(date) - days(14))
+
+test <- covid %>% filter(date > max(date) - days(14))
+
+paste0("train: ", min(train$date), " - ", max(train$date)) %>% print()
+paste0("test: ", min(test$date), " - ", max(test$date)) %>% print()
+
+
+
 
 set.seed(123)
-sampled_id <- unique(train$country_id)[sample(1:length(unique(train$country_id)), 10)]
-sampled_id <- c(sampled_id, "Italy", "France", "Germany", "Sweden", "US_New York", "Thailand", "China_Hubei", "Afghanistan")
+sampled_id <- unique(train$country )[sample(1 : length(unique(train$country)), 10)]
+sampled_id <- c(sampled_id, "Italy", "France", "Germany", "Sweden", "US", "Thailand", "China", "Afghanistan")
 
-train <- train %>% filter(country_id %in% sampled_id)
+# train <- train %>% filter(country %in% sampled_id)
+# 
+# test <- test %>% filter(country %in% sampled_id)
 
-test <-  test %>% 
-  mutate(country_id = case_when(is.na(state) ~ country,
-                                TRUE ~ paste0(country, "_", state)))
-
-paste0("Train: ", min(train$Date), " - ", max(train$Date)) %>% print()
-paste0("Test: ", min(test$Date), " - ", max(test$Date)) %>% print()
 
 ```
 
@@ -67,64 +84,35 @@ paste0("Test: ", min(test$Date), " - ", max(test$Date)) %>% print()
 ```{r EDA, results='asis', tidy=FALSE, message=FALSE, warning=FALSE}
 #First detected case
 day_of_first_case <-  train %>%
-  filter(ConfirmedCases > 0) %>%
-  group_by(country_id) %>%
-  summarise(day_of_first_case = min(Date)) %>%
+  filter(confirmed > 0) %>%
+  group_by(iso3c) %>%
+  summarise(day_of_first_case = min(date)) %>%
   ungroup()
 
 train <- train %>%
-         inner_join(day_of_first_case, by = "country_id") %>%
-          mutate(days_since_first_case = as.numeric(difftime(Date, day_of_first_case, units ="days")),
-               # days_since_first_case =ifelse(days_since_first_case < 0, -1, days_since_first_case),
-                days_since_global_outbreak  = as.numeric(difftime(Date, min(Date), units ="days")))
+         inner_join(day_of_first_case, by = "iso3c") %>%
+          mutate(
+          days_since_first_case = as.numeric(difftime(date, day_of_first_case, units ="days")),
+          days_since_first_case =ifelse(days_since_first_case < 0, -1, days_since_first_case),
+          days_since_global_outbreak  = as.numeric(difftime(date, min(date), units ="days")))
 
 
 test <- test %>%
-         inner_join(day_of_first_case, by = "country_id") %>%
-          mutate(days_since_first_case = as.numeric(difftime(Date, day_of_first_case, units ="days")),
-               # days_since_first_case =ifelse(days_since_first_case < 0, -1, days_since_first_case),
-                days_since_global_outbreak  = as.numeric(difftime(Date, min(Date), units ="days")))
-
-country_level <- train %>%
-                 group_by(country, Date, days_since_global_outbreak) %>%
-                 summarise(days_since_first_case = max(days_since_first_case),
-                           Fatalities = sum(Fatalities),
-                           ConfirmedCases = sum(ConfirmedCases)) %>%
-                 ungroup()
+         inner_join(day_of_first_case, by = "iso3c") %>%
+          mutate(
+          days_since_first_case = as.numeric(difftime(date, day_of_first_case, units ="days")),
+          days_since_first_case =ifelse(days_since_first_case < 0, -1, days_since_first_case),
+          days_since_global_outbreak  = as.numeric(difftime(date, min(date), units ="days")))
 
 
-
-train %>% filter(ConfirmedCases > 0) %>%
-hchart(., "line", hcaes(x = days_since_first_case, y = ConfirmedCases, group = country_id))
+train %>% filter(confirmed > 0) %>%
+hchart(., "line", hcaes(x = days_since_first_case, y = confirmed, group = country))
 
 #WDI Data
-###additional data
-population <- WDI(indicator='SP.POP.TOTL', country="all",start=2018, end=2018) %>%
-  mutate(country = case_when(country == "Brunei Darussalam" ~ "Brunei" ,
-                             country == "Venezuela, RB" ~ "Venezuela", 
-                             country == "United States" ~ "US",
-                             country == "Bahamas, The" ~ "Bahamas",
-                             country == "Czech Republic" ~ "Czechia",
-                             country == "Egypt, Arab Rep." ~ "Egypt",
-                             country == "Gambia, The" ~ "Gambia",
-                             country == "Iran, Islamic Rep." ~ "Iran",
-                             country == "Korea, Rep." ~ "Korea, South",
-                             country == "Kyrgyz Republic" ~ "Kyrgyzstan",
-                             country == "Russian Federation" ~ "Russia",
-                             country == "Lao PDR" ~ "Laos",
-                             country == "St. Kitts and Nevis" ~ "Saint Kitts and Nevis",
-                             country == "St. Lucia" ~ "Saint Lucia",
-                             country == "St. Vincent and the Grenadines" ~ "Saint Vincent and the Grenadines",
-                             country == "Slovak Republic" ~ "Slovakia",
-                             country == "Syrian Arab Republic" ~ "Syria",
-                             country == "Congo, Dem. Rep." ~ "Congo (Kinshasa)",
-                             country == "Congo, Rep." ~ "Congo (Brazzaville)",
-                             country == "" ~ "",
-                             country == "" ~ "",
-                             TRUE ~ country))
-
-if(!file.exists("wdi_dat.csv")){
-  wdi_dat <- WDI(indicator = c("NY.GDP.PCAP.KD",
+if(!file.exists("data/wdi_dat.csv")){
+  wdi_dat <- WDI(indicator = c(
+                               "SP.POP.TOTL",
+                               "NY.GDP.PCAP.KD",
                                "SP.DYN.LE00.IN", 
                                "SP.DYN.IMRT.IN", 
                                "ST.INT.DPRT",
@@ -142,13 +130,12 @@ if(!file.exists("wdi_dat.csv")){
                                "SP.POP.65UP.TO.ZS",
                                "SP.URB.TOTL.IN.ZS",
                                "EN.POP.SLUM.UR.ZS",
-                               "SP.POP.LAND.ZS",
                                "per_si_allsi.cov_pop_tot"
                                
                                ), start = 1960, end = 2018, extra = TRUE)
-  write.csv(wdi_dat, "wdi_dat.csv", row.names = FALSE)
+  write.csv(wdi_dat, "data/wdi_dat.csv", row.names = FALSE)
 } else {
-  wdi_dat <- read.csv("wdi_dat.csv")
+  wdi_dat <- read_csv("data/wdi_dat.csv")
 }
 
 #lattest value per country
@@ -157,7 +144,7 @@ wdi_agg <- wdi_dat %>%
             mutate(longitude = as.numeric(as.character(longitude)),
                    latitude = as.numeric(as.character(latitude))) %>%
             arrange(iso2c, country, year) %>%
-            group_by(iso2c, iso3c, country, region) %>%
+            group_by(iso2c, iso3c, region) %>%
             summarise_if(is.numeric, ~dplyr::last(na.omit(.))) %>%
             ungroup()
 
@@ -170,70 +157,56 @@ vars <- map_df(wdi_agg, ~sum(is.na(.)) / length(.) * 100)  %>%
 
 wdi_agg <- wdi_agg %>% select(all_of(vars))
 
-country_level <- train %>%
-              filter(Date == max(Date)) %>%
-              left_join(population, by = "country") %>%
-              left_join(population %>% select(country, SP.POP.TOTL), by = c("state" = "country")) %>%
-               mutate(SP.POP.TOTL = coalesce(SP.POP.TOTL.y, SP.POP.TOTL.x)) %>%
-                 group_by(country, Date, days_since_global_outbreak, iso2c) %>%
-                 summarise(days_since_first_case = max(days_since_first_case),
-                           SP.POP.TOTL = min(SP.POP.TOTL), 
-                           Fatalities = sum(Fatalities),
-                           ConfirmedCases = sum(ConfirmedCases)) %>%
-                 ungroup()
+#combine timeseries and wdia data
+train <- train %>% 
+         left_join(wdi_agg, by ="iso3c")
 
-k <- 100000
-country_level <- country_level %>% 
-                 left_join(wdi_agg, by = "iso2c") %>%
-                  mutate(Fatalities_per_100K = Fatalities / SP.POP.TOTL * k,
-                         ConfirmedCases_per_100K = ConfirmedCases / SP.POP.TOTL * k) %>%
-                  filter(!is.na(iso2c))
-          
+test <- test %>% 
+         left_join(wdi_agg, by ="iso3c")
+
+#calculaute per 100K
+k <- 10 ^ 5
+train <- train %>%
+         mutate(Fatalities_per_100K = deaths / SP.POP.TOTL * k,
+                ConfirmedCases_per_100K = confirmed / SP.POP.TOTL * k,
+                Recovered_per_100K = recovered / SP.POP.TOTL * k,
+                )
 
 
-Geo <- gvisGeoChart(country_level %>%
-                   select(iso2c, ConfirmedCases),
-                 locationvar="iso2c", 
-                 colorvar="ConfirmedCases",
-                 options=list(projection="kavrayskiy-vii",
+train %>% 
+  filter(date == max(date)) %>%
+  select(iso2c, confirmed) %>%
+  gvisGeoChart(locationvar = "iso2c", 
+                 colorvar = "confirmed",
+                 options = list(projection="kavrayskiy-vii",
                               colorAxis="{colors:['#91BFDB', '#FC8D59']}",
-                              gvis.editor="Choose Region"))
-plot(Geo)
-
-country_level_motion <- train %>%
-              left_join(population, by = "country") %>%
-              left_join(population %>% select(country, SP.POP.TOTL), by = c("state" = "country")) %>%
-               mutate(SP.POP.TOTL = coalesce(SP.POP.TOTL.y, SP.POP.TOTL.x)) %>%
-                 group_by(country, Date, days_since_global_outbreak, iso2c) %>%
-                 summarise(days_since_first_case = max(days_since_first_case),
-                           SP.POP.TOTL = min(SP.POP.TOTL), 
-                           Fatalities = sum(Fatalities),
-                           ConfirmedCases = sum(ConfirmedCases)) %>%
-                 ungroup()
-
-country_level_motion <- country_level_motion %>% 
-                 left_join(wdi_agg %>% select(-country), by = "iso2c") %>%
-                  mutate(Fatalities_per_100K = Fatalities / SP.POP.TOTL * k,
-                         ConfirmedCases_per_100K = ConfirmedCases / SP.POP.TOTL * k) %>%
-                  filter(!is.na(iso2c))
-
-# Motion <- gvisMotionChart(country_level_motion,                       ,
-#                         idvar="country",
-#                         xvar ="ConfirmedCases",
-#                         yvar = "Fatalities",
-#                         timevar="Date")
-# #Motion$html$caption=""
-# plot(Motion)
+                              gvis.editor="Choose Region")) %>%
+  plot()
 
 
-country_level %>% filter(!is.na(iso2c)) %>%
-    select(iso2c,ConfirmedCases, ConfirmedCases_per_100K, Fatalities, Fatalities_per_100K) %>%
+
+
+train %>% 
+  filter(!is.na(iso2c)) %>%
+  filter(date == max(date)) %>%
+  select(iso2c, confirmed, ConfirmedCases_per_100K, deaths, Fatalities_per_100K, recovered,  Recovered_per_100K) %>%
   gvisIntensityMap() %>%
   plot()
 
 
+
+Motion <- gvisMotionChart(train %>%
+                            select(-timestamp, -latitude, -longitude),                       ,
+                        idvar="country",
+                        xvar ="confirmed",
+                        yvar = "deaths",
+                        timevar="date")
+#Motion$html$caption=""
+plot(Motion)
+
 make_scatter <- function(x, y, xlog = TRUE, ylog = TRUE){
-  plot <- country_level %>%
+  plot <- train %>%
+    filter(date == max(date)) %>%
     ggplot(aes_string( y = y,  x = x)) +
     geom_jitter() 
   if(ylog){
@@ -247,28 +220,30 @@ make_scatter <- function(x, y, xlog = TRUE, ylog = TRUE){
 return(plot)
 }
 
-wdi <- names(wdi_agg)[4 : ncol(wdi_agg)]
-scatter_cases <- map(wdi,make_scatter, "ConfirmedCases")
+wdi <- names(wdi_agg)[5 : (ncol(wdi_agg) - 2)]
+scatter_cases <- map(wdi,make_scatter, "confirmed")
 
 n <- length(scatter_cases)
 nCol <- floor(sqrt(n))
 do.call("grid.arrange", c(scatter_cases, ncol = nCol))
 
-scatter_fatalities <- map(wdi, make_scatter, "Fatalities", ylog = TRUE)
+scatter_fatalities <- map(wdi, make_scatter, "deaths", ylog = TRUE)
 
 n <- length(scatter_fatalities)
 nCol <- floor(sqrt(n))
 do.call("grid.arrange", c(scatter_fatalities, ncol = nCol))
 
-country_level %>% 
+train %>% 
+  filter(date == max(date)) %>%
     select(-c(days_since_global_outbreak ,Fatalities_per_100K, ConfirmedCases_per_100K, year )) %>%
-    select(Fatalities, ConfirmedCases, everything()) %>%
+    select(deaths, confirmed, everything()) %>%
   drop_na() %>%
   select_if(is.numeric) %>%
   ggpairs()
 
-country_level %>% 
-  select(-c(days_since_global_outbreak ,Fatalities_per_100K, ConfirmedCases_per_100K, year )) %>%
+train %>% 
+  filter(date == max(date)) %>%
+  select(-c(days_since_global_outbreak ,Fatalities_per_100K, ConfirmedCases_per_100K, year, Recovered_per_100K, longitude, latitude )) %>%
   drop_na() %>%
   select_if(is.numeric) %>%
   cor() %>%
@@ -279,7 +254,22 @@ country_level %>%
 ```{r}
 #https://github.com/joachim-gassen/tidycovid19
 
-gov <- download_acaps_npi_data() 
+
+gov <- read_csv("data/gov.csv")
+
+#download new data if available
+if(max(gov$timestamp) < today() - days(1) ){
+
+  gov_new <- download_acaps_npi_data() 
+  
+  #additional check
+  if(nrow(gov_new) > nrow(gov)){
+  gov <- gov_new
+  rm(gov_new)
+  write_csv(gov, "data/gov.csv")
+  }
+}
+
 gov$date_implemented <- as.Date(gov$date_implemented)
 
 
@@ -311,10 +301,10 @@ gov %>% count(category, date_implemented) %>%
   ggtitle("Timeline Government Interventions")
 
 
-country_level_motion %>%
-              select(iso3c, iso2c, Date, region, days_since_first_case, ConfirmedCases) %>%
+  train %>%
+              select(iso3c, iso2c, date, region, days_since_first_case) %>%
               inner_join(gov %>% count(category, date_implemented, iso3c), 
-                         by = c("iso3c", "Date" = "date_implemented")) %>%
+                         by = c("iso3c", "date" = "date_implemented")) %>%
   group_by(days_since_first_case, category) %>%
   summarise(n = sum(n)) %>%
   ggplot(aes(x = days_since_first_case, y = n, fill = category)) +
@@ -328,22 +318,22 @@ country_level_motion %>%
 
 categories_list <- unique(gov$category)
  
- 
+#Median Growth Rate of different government measures
 measures_plot1 <- map(categories_list, ~
-country_level_motion %>%
-              select(iso3c, iso2c, Date, region, days_since_first_case, ConfirmedCases) %>%
+train %>%
+              select(iso3c, iso2c, date, region, days_since_first_case, confirmed) %>%
               left_join(gov %>% group_by(category,iso3c) %>% 
               filter(category == .x) %>%         
   summarise(n = n(), date_implemented =  min(date_implemented,na.rm =TRUE)), 
                          by = c("iso3c")) %>%
   group_by(iso2c) %>%
-  mutate(ConfirmedCases_ma = rollapply(ConfirmedCases, width = 7,
+  mutate(ConfirmedCases_ma = rollapply(confirmed, width = 7,
                                        FUN = sum, align = "right", fill =NA),
          growthrate = ConfirmedCases_ma / lag(ConfirmedCases_ma)- 1,
          doubling_time = log(2) / log(growthrate + 1)) %>%
   filter(!is.na(growthrate)) %>%
   mutate(measure_implemented = case_when(is.na(date_implemented) ~ "not implemented",
-         Date < date_implemented ~ "not implemented",
+         date < date_implemented ~ "not implemented",
          TRUE ~ "implemented")) %>%
   group_by(measure_implemented, days_since_first_case) %>%
   summarise(mean = mean(growthrate),
@@ -376,69 +366,23 @@ country_level_motion %>%
 n <- length(measures_plot1)
 nCol <- floor(sqrt(n))
 do.call("grid.arrange", c(measures_plot1, ncol = nCol))
-#######################################################
-measures_plot2 <- map(categories_list, ~
-country_level_motion %>%
-              select(iso3c, iso2c, Date, region, days_since_first_case, ConfirmedCases) %>%
-              left_join(gov %>% group_by(category,iso3c) %>% 
-              filter(category == .x) %>%         
-  summarise(n = n(), date_implemented =  min(date_implemented,na.rm =TRUE)), 
-                         by = c("iso3c")) %>%
-  group_by(iso2c) %>%
-  mutate(ConfirmedCases_ma = rollapply(ConfirmedCases, width = 7,
-                                       FUN = sum, align = "right", fill =NA),
-         growthrate = ConfirmedCases_ma / lag(ConfirmedCases_ma)- 1,
-         doubling_time = log(2) / log(growthrate + 1)) %>%
-  filter(!is.na(growthrate)) %>%
-  mutate(measure_implemented = case_when(is.na(date_implemented) ~ "not implemented",
-         Date < date_implemented + days(14) ~ "not implemented",
-         TRUE ~ "implemented for 14 days")) %>%
-  group_by(measure_implemented, days_since_first_case) %>%
-  summarise(mean = mean(growthrate),
-            std_err = sd(growthrate)/sqrt(n()),
-             n = n()) %>%
-  filter(n > 5  & days_since_first_case < 40 ) %>%
-    ggplot(aes(x = days_since_first_case, y = mean, color =measure_implemented )) +
-    geom_pointrange(
-      aes(ymin = mean-1.96*std_err, ymax = mean+1.96*std_err),
-      position=position_dodge(0.4)
-    ) +
-    labs(
-      x = "Days since first case detected",
-      y = "Growth Rate Confirmed Cases",
-      color = .x
-    ) + 
-    theme_minimal() + 
-    theme(
-      legend.position = c(0.75, 0.75),
-      plot.title.position = "plot", 
-      plot.caption.position =  "plot",
-      plot.caption = element_text(hjust = 0),
-      axis.title.x = element_text(hjust = 1),
-      axis.title.y = element_text(hjust = 1),
-    ) +
-    scale_y_continuous(labels = scales::percent) +
-   scale_color_tableau()
-)
 
-n <- length(measures_plot2)
-nCol <- floor(sqrt(n))
-do.call("grid.arrange", c(measures_plot2, ncol = nCol))
 ######################################################
-measure_plot3 <- map(categories_list, ~country_level_motion %>%
-  select(iso3c, iso2c, Date, region, days_since_first_case, ConfirmedCases) %>%
+###Box plot of growth rate by days implemented
+measure_plot3 <- map(categories_list, ~ train %>%
+  select(iso3c, iso2c, date, region, days_since_first_case, confirmed) %>%
   left_join(gov %>% group_by(category,iso3c) %>% 
               filter(category == .x) %>%         
               summarise(n = n(), date_implemented =  min(date_implemented,na.rm =TRUE)), 
             by = c("iso3c")) %>%
   group_by(iso2c) %>%
-  mutate(ConfirmedCases_ma = rollapply(ConfirmedCases, width = 7,
+  mutate(ConfirmedCases_ma = rollapply(confirmed, width = 7,
                                        FUN = sum, align = "right", fill =NA),
          growthrate = ConfirmedCases_ma / lag(ConfirmedCases_ma)- 1,
          doubling_time = log(2) / log(growthrate + 1)) %>%
   filter(!is.na(growthrate)) %>%
   ungroup() %>%
-  mutate(days_implemented = difftime(Date, date_implemented, units = "days")) %>%
+  mutate(days_implemented = difftime(date, date_implemented, units = "days")) %>%
   filter(days_implemented >= 0 & days_implemented < 40)  %>%
   ggplot(aes(x = factor(days_implemented), y =  growthrate)) + 
   geom_boxplot() +
@@ -450,76 +394,37 @@ measure_plot3 <- map(categories_list, ~country_level_motion %>%
 n <- length(measure_plot3)
 nCol <- floor(sqrt(n))
 do.call("grid.arrange", c(measure_plot3, ncol = nCol))
+######
+measures_list <- unique(gov$measure)
 
+measure_plot4 <- map(measures_list, ~ train %>%
+  select(iso3c, iso2c, date, region, days_since_first_case, confirmed) %>%
+  left_join(gov %>% group_by(measure, iso3c) %>% 
+              filter(measure == .x) %>%         
+              summarise(n = n(), date_implemented =  min(date_implemented,na.rm =TRUE)), 
+            by = c("iso3c")) %>%
+  group_by(iso2c) %>%
+  mutate(ConfirmedCases_ma = rollapply(confirmed, width = 7,
+                                       FUN = sum, align = "right", fill =NA),
+         growthrate = ConfirmedCases_ma / lag(ConfirmedCases_ma)- 1,
+         doubling_time = log(2) / log(growthrate + 1)) %>%
+  filter(!is.na(growthrate)) %>%
+  ungroup() %>%
+  mutate(days_implemented = difftime(date, date_implemented, units = "days")) %>%
+  filter(days_implemented >= 0 & days_implemented < 40)  %>%
+  ggplot(aes(x = factor(days_implemented), y =  growthrate)) + 
+  geom_boxplot() +
+  xlab( paste0("Days ", .x, " is in place" )) +
+  ylab("Growth Rate Confirmed Cases") +
+  scale_y_continuous(labels = scales::percent)
+)
 
-######################################################
-# gov_agg <- gov %>%
-#             mutate(measure = str_trim(str_replace_all(measure, " ", "_")),
-#                    measure =str_replace_all(measure, "[[:punct:]]", "")) %>%
-#             #filter(!is.na(admin_level_name)) %>% # if local measures should be included or not
-#             group_by(country, iso3c, measure) %>%
-#             summarise(date_implemented = min (date_implemented, na.rm = TRUE)) %>%
-#             ungroup() %>%
-#             pivot_wider(names_from = measure, values_from = date_implemented)
-# ##calculate doubling time  and  days since implementation
-# # more than 14 days in place
-# measure_names <- names(gov_agg)[3 : ncol(gov_agg)]
-# 
-# gov_cases <- country_level_motion %>%
-#               select(iso3c, iso2c, Date, region, days_since_first_case, ConfirmedCases) %>%
-#                #filter(iso2c == "DE") %>%
-#               inner_join(gov_agg, by = "iso3c")
-# 
-#  time <- gov_cases %>%
-#          mutate_at(.vars = measure_names, ~ as.numeric(difftime(Date, . , units = "days" ))) %>%
-#          group_by(iso2c) %>%
-#   mutate(ConfirmedCases_ma = rollapply(ConfirmedCases, width = 7,
-#                                        FUN = sum, align = "right", fill =NA),
-#          growthrate = ConfirmedCases_ma / lag(ConfirmedCases_ma)- 1,
-#          doubling_time = log(2) / log(growthrate + 1)) %>%
-#   filter(!is.na(growthrate))
-# 
-# measure_plot <- map(measure_names, ~
-#                time %>%
-#                  filter(eval(parse(text = .x)) >= 0) %>%
-#               ggplot(., aes(y = doubling_time, x = eval(parse(text = .x)), color = iso2c, alpha = 0.3)) +
-#                  geom_jitter() +
-#                  geom_smooth(method = "lm", se = FALSE) +
-#                  scale_y_log10() +
-#                 xlab(paste0("Days since Implementation of ", .x))+
-#                 # facet_wrap(~region) +
-#                theme(legend.position = "none")
-#               )
-# n <- length(measure_plot)
-# nCol <- floor(sqrt(n))
-# do.call("grid.arrange", c(measure_plot, ncol = nCol))
+n <- length(measure_plot4)
+nCol <- floor(sqrt(n))
+do.call("grid.arrange", c(measure_plot4, ncol = nCol))
 
  
-# reg <- time %>%
-#         mutate_at(.vars = measure_names, ~case_when(is.na(.) ~ 0,
-#                                                   . < 14 ~ 0,
-#                                                       TRUE ~ 1)) %>%
-#   ungroup() %>%
-#   select(doubling_time, all_of(measure_names)) %>%
-#   filter(is.finite(doubling_time))
-# 
-# measure_names <- map_df(reg, mean) %>% gather() %>%
-#   filter(value > 0) %>% pull(key)
-# 
-# reg <- reg %>% select(all_of(measure_names))
-# 
-# lm <- lm(doubling_time ~., data = reg)
-# 
-# tidy(lm) %>% filter(p.value > 0.005)
-# 
-# tidy(lm) %>% filter(p.value < 0.005) %>%
-#   arrange(estimate) %>%
-#   ggplot()
 
-# ranger <- ranger(doubling_time ~., data = reg, importance ="impurity")
-# 
-# importance_data <- importance(ranger) %>% as.data.frame(row.names = F)
-# col
 ```
 
 
@@ -528,19 +433,19 @@ do.call("grid.arrange", c(measure_plot3, ncol = nCol))
 
 train_ts <- train %>%   
                 as_tsibble(
-                index = Date,
-                key = country_id
+                index = date,
+                key = country
               )
 
 confirmed_cases_features <- train_ts %>%
-                            features(ConfirmedCases, feat_stl)
+                            features(confirmed, feat_stl)
 
 confirmed_cases_features %>%
   select(2 : 10) %>%
   ggpairs()
 
 pcs <- train_ts %>%
-      features(ConfirmedCases, feat_stl) %>%
+      features(confirmed, feat_stl) %>%
       select(2 : 10) %>%
       prcomp(scale = TRUE) %>%
 broom::augment(confirmed_cases_features)
@@ -552,69 +457,48 @@ geom_point() + theme(aspect.ratio=1)
 
 outlier <- pcs %>%
   filter(.fittedPC1 == max(.fittedPC1)) %>% 
-  pull(country_id)
+  pull(country)
 
 train_ts %>%
-  filter(country_id == outlier) %>%
-  feasts::autoplot(ConfirmedCases)
+  filter(country == outlier) %>%
+  feasts::autoplot(confirmed)
+
+#Decompose a time series in preparation for anomaly detection
+# Seasonal-Trend-Loess (STL) Decomposition in the form of “observed”, “season”, “trend” and “remainder”
+set.seed(123)
+sampled_id <- unique(train$country )[sample(1 : length(unique(train$country)), 10)]
+sampled_id <- c(sampled_id, "Italy", "France", "Germany", "Sweden", "US", "Thailand", "China", "Afghanistan")
+
+#show subset of countries
+train %>% 
+  filter(country %in% sampled_id) %>%
+  group_by(country) %>%
+    arrange(date) %>%
+    mutate(confirmed = log(confirmed + 1 )) %>%
+    time_decompose(confirmed) %>%
+    anomalize(remainder) %>%
+    time_recompose() %>%
+    plot_anomalies(ncol = 3, alpha_dots = 0.3)
+# the STL has some problems to detect the exponential trend in some cases
 
 
-fatalities_features <- train_ts %>%
-  group_by_key() %>%
-  filter(!all(Fatalities == 0)) %>%
-  ungroup() %>%
-features(Fatalities, feat_stl)
-
-fatalities_features %>%
-  select(2 : 10) %>%
-  ggpairs()
-
-pcs <- train_ts %>%
-      group_by_key() %>%
-      filter(!all(Fatalities == 0)) %>%
-      ungroup() %>%
-      features(Fatalities, feat_stl) %>%
-      select(2 : 10) %>%
-      prcomp(scale = TRUE) %>%
-broom::augment(fatalities_features)
 
 
-pcs %>% ggplot(aes(x=.fittedPC1, y=.fittedPC2)) +
-geom_point() + theme(aspect.ratio=1)
-
-
-outlier <- pcs %>%
-  filter(.fittedPC1 == min(.fittedPC1)) %>% 
-  pull(country_id)
-
-train_ts %>%
-  filter(country_id == outlier) %>%
-  feasts::autoplot(Fatalities)
 
 ```
 # Feature Engineering
 ## WDI
 ```{r}
-train <- train %>% left_join(population, by = "country") %>%
-        left_join(population %>% select(country, SP.POP.TOTL), by = c("state" = "country")) %>%
-         mutate(SP.POP.TOTL = coalesce(SP.POP.TOTL.y, SP.POP.TOTL.x)) %>%
-        select(-c(SP.POP.TOTL.y, SP.POP.TOTL.x))
 
 
-train <- train %>% left_join(wdi_agg %>% select(-c(year, region, country)), by = "iso2c")
-
-train %>% select(-state)  %>% plot_missing()
-
-test <- test %>% left_join(population, by = "country") %>%
-        left_join(population %>% select(country, SP.POP.TOTL), by = c("state" = "country")) %>%
-         mutate(SP.POP.TOTL = coalesce(SP.POP.TOTL.y, SP.POP.TOTL.x)) %>%
-        select(-c(SP.POP.TOTL.y, SP.POP.TOTL.x))
+train  %>% plot_missing()
 
 
-test <- test %>% left_join(wdi_agg %>% select(-c(year, region, country)), by = "iso2c")
+
+#test <- test %>% left_join(wdi_agg %>% select(-c(year, region)), by = "iso2c")
 
 ```
-## Goverment Inverntions
+## Goverment Inventions
 ```{r}
 gov_wide <- gov %>%
             filter(is.na(admin_level_name)) %>%
@@ -628,6 +512,19 @@ gov_wide <- gov %>%
 categories_list <-  str_trim(str_replace_all(categories_list, " ", "_")) %>%
                     str_replace_all(., "[[:punct:]]", "")
 
+measures_list <-    str_trim(str_replace_all(measures_list, " ", "_")) %>%
+                    str_replace_all(., "[[:punct:]]", "") %>%
+                    str_to_lower(.)
+
+gov_measures <-  gov %>%
+                 #measure should be at leat 14 days in place
+                 mutate(date_implemented = date_implemented + days(14),
+                        measure = str_to_lower(str_trim(str_replace_all(measure, " ", "_"))),
+                        measure = str_replace_all(measure, "[[:punct:]]", "")) %>%
+                 count(measure, date_implemented, iso3c) %>%
+                 rename(distance_measures = n) %>%
+                 pivot_wider(names_from = measure, values_from = distance_measures)
+
 overall_distancing_measures <- gov %>%
                               #measure should be at leat 14 days in place
                               mutate(date_implemented = date_implemented + days(14)) %>%
@@ -637,23 +534,20 @@ overall_distancing_measures <- gov %>%
                               rename(distance_measures = n)
 
 
-train <- train %>% left_join(gov_wide, by = "iso3c") %>%
-         mutate_at(.vars = categories_list, ~ as.numeric(difftime(Date, . , units = "days" ))) %>%
-         mutate_at(.vars = categories_list, ~case_when(is.na(.) ~ "no",
-                                                  . < 14 ~ "no",
-                                                      TRUE ~ "yes")) %>%
-        left_join(overall_distancing_measures, by = c("iso3c", "Date" = "date_implemented")) %>%
-        group_by(country_id) %>%
-        mutate(distance_measures = cumsum(coalesce(distance_measures, 0L)))
+train <- train %>% 
+         left_join(gov_measures, c("iso3c", "date" = "date_implemented")) %>%
+         mutate_at(.vars = measures_list, ~  cumsum(coalesce(., 0L)) ) %>%
+         left_join(overall_distancing_measures, by = c("iso3c", "date" = "date_implemented")) %>%
+         group_by(country) %>%
+         mutate(distance_measures = cumsum(coalesce(distance_measures, 0L)))
 
-test <- test %>% left_join(gov_wide, by = "iso3c") %>%
-         mutate_at(.vars = categories_list, ~ as.numeric(difftime(Date, . , units = "days" ))) %>%
-         mutate_at(.vars = categories_list, ~case_when(is.na(.) ~ "no",
-                                                  . < 14 ~ "no",
-                                                      TRUE ~ "yes")) %>%
-        left_join(overall_distancing_measures, by = c("iso3c", "Date" = "date_implemented")) %>%
-        group_by(country_id) %>%
-        mutate(distance_measures = cumsum(coalesce(distance_measures, 0L)))
+test <- test %>% 
+         left_join(gov_measures, c("iso3c", "date" = "date_implemented")) %>%
+         mutate_at(.vars = measures_list, ~  cumsum(coalesce(., 0L)) ) %>%
+         left_join(overall_distancing_measures, by = c("iso3c", "date" = "date_implemented")) %>%
+         group_by(country) %>%
+         mutate(distance_measures = cumsum(coalesce(distance_measures, 0L))) %>%
+         ungroup()
 
 
 ```
@@ -661,104 +555,94 @@ test <- test %>% left_join(gov_wide, by = "iso3c") %>%
 ## Lagged Features
 ```{r}
 #https://gist.github.com/drsimonj/2038ff9f9c67063f384f10fac95de566
-lag <- 14
 
+lag <- 14
 lags <- seq(lag)
 lag_names <- paste("diff_cases_lag", formatC(lags, width = nchar(max(lags)), flag = "0"), 
                    sep = "_")
 lag_functions_cases <- setNames(paste("dplyr::lag(., ", lags, ")"), lag_names)
 
-lag_names <- paste("diff_fatalities_lag", formatC(lags, width = nchar(max(lags)), flag = "0"), 
-                   sep = "_")
-lag_functions_fatalities <- setNames(paste("dplyr::lag(., ", lags, ")"), lag_names)
-
 train <- train %>%
-        group_by(country_id) %>%
-        arrange(Id) %>%
-        mutate(diff_cases = ConfirmedCases - lag(ConfirmedCases),
-               diff_fatalities = Fatalities - lag(Fatalities)) %>%
-        mutate_at(vars(diff_cases), funs_(lag_functions_cases)) %>%
-        mutate_at(vars(diff_fatalities), funs_(lag_functions_fatalities)) %>%
+        group_by(country) %>%
+        arrange(country, date) %>%
+        mutate(log_cases = log(confirmed + 1),
+                log_cases = log_cases - lag(log_cases)) %>%
+        mutate_at(vars(log_cases), funs_(lag_functions_cases)) %>%
         ungroup()
 
 
 
 #combine lagged features with training data
 train_lagged <- train %>% 
-                filter(Date >= min(Date) + days(lag + 1)) %>%
-                arrange(Date, Id)
+                filter(date >= min(date) + days(lag + 1)) %>%
+                arrange(date, country)
 ```
 # ML Models
-## Fatalities
+# Recursive Strategy
+https://www.statworx.com/de/blog/time-series-forecasting-with-random-forest/
 ```{r}
-#remove fatalities features
-feature_names <- names(train_lagged)[ !str_detect(names(train_lagged), "fatalities")]
+#columns to remove 
+col_rem <- c("country", "iso3c", "date", "deaths", "timestamp", "day_of_first_case",
+              "distance_measures", "iso2c", "year", "confirmed", "recovered", "ConfirmedCases_per_100K", "Fatalities_per_100K","Recovered_per_100K")
 
 train_cases <- train_lagged %>%
-               select(all_of(feature_names)) %>%
-               select(-c(Id,
-                         country,
-                          iso2c,
-                         iso3c,
-                          day_of_first_case,
-                          year,
-                          Fatalities,
-                          ConfirmedCases,
-                          country_id,
-                         state,
-                         Date)
-                         )
+               select(- all_of(col_rem))
+         
                          
-recipe_confirmedcases <- recipe(diff_cases ~ ., train_cases) %>%
+recipe_confirmedcases <- recipe(log_cases ~ ., train_cases) %>%
   step_medianimpute(all_numeric(), -all_outcomes()) %>%
   step_center(all_numeric(), -all_outcomes()) %>%
   step_scale(all_numeric(), -all_outcomes()) %>%
   step_zv(all_predictors(), -all_outcomes()) %>%
-  step_dummy(all_nominal(), -all_outcomes()) #%>%
-  #prep(data = train_cases)   
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  prep(data = train_cases)   
 ###
 training_set <-  train_lagged  %>%
-  filter(Date <= max(Date) - days(period)) %>%
+  filter(date <= max(date) - days(period)) %>%
+  select(- all_of(col_rem)) %>%
   bake(recipe_confirmedcases, new_data = .) %>%
-  select(diff_cases, everything())
+  select(log_cases, everything())
 
 test_set <- train_lagged %>%
-  filter( Date > max(Date)- days(7)) %>%
-  mutate(days_since_first_case = ifelse(day_of_first_case >= max(Date) - days(period), -1, days_since_first_case)) %>%
+  filter( date > max(date)- days(period)) %>%
+  mutate(days_since_first_case = ifelse(day_of_first_case >= max(date) - days(period), -1,   days_since_first_case)) %>%
+  select(- all_of(col_rem)) %>% 
   bake(recipe_confirmedcases, new_data = .) %>%
-  select(diff_cases, everything()) 
+  select(log_cases, everything()) 
 
 #show Folds (Date Column is required)
-n_countries <- train_lagged %>% distinct(country_id) %>% nrow()
+n_countries <- train_lagged %>% distinct(country) %>% nrow()
+init <- 27
 rolling_folds <- train_lagged  %>%
+                 filter(date <= max(date) - days(period)) %>%
                  rolling_origin(.,
-                                initial =  28 * n_countries,
+                                initial =  init * n_countries,
                                 assess =  7 * n_countries,
                                 skip = 7 * n_countries,
-                                cumulative = FALSE)
+                                cumulative = TRUE)
 
+#print folds using the date column
 for(i in 1: length(rolling_folds$splits)){
-
-model_from <- rolling_folds$splits[[i]] %>% analysis() %>% pull(Date) %>% min()
-model_to <- rolling_folds$splits[[i]] %>% analysis() %>% pull(Date) %>% max()
-assesment_from <- rolling_folds$splits[[i]] %>% assessment() %>% pull(Date) %>% min()
-assesment_to <- rolling_folds$splits[[i]] %>% assessment() %>% pull(Date) %>% max()
-print(paste0("Fold ", i))
-print(paste0("Modelling ", model_from, " - ", model_to ))
-print(paste0("Assesment ", assesment_from, " - ", assesment_to ))
+  model_from <- rolling_folds$splits[[i]] %>% analysis() %>% pull(date) %>% min()
+  model_to <- rolling_folds$splits[[i]] %>% analysis() %>% pull(date) %>% max()
+  assesment_from <- rolling_folds$splits[[i]] %>% assessment() %>% pull(date) %>% min()
+  assesment_to <- rolling_folds$splits[[i]] %>% assessment() %>% pull(date) %>% max()
+  print(paste0("Fold ", i))
+  print(paste0("Modelling ", model_from, " - ", model_to ))
+  print(paste0("Assesment ", assesment_from, " - ", assesment_to ))
 
 }
 ####
 
 
 #Create Folds for modeling excluding date column
-n_countries <- train %>% distinct(country_id) %>% nrow()
-rolling_folds <- training_set  %>%
+n_countries <- train %>% distinct(country) %>% nrow()
+rolling_folds <- training_set %>%
                  rolling_origin(.,
-                                initial =  28 * n_countries,
+                                initial =  init * n_countries,
                                 assess =  7 * n_countries,
                                 skip = 7 * n_countries,
-                                cumulative = FALSE)
+                                cumulative = TRUE)
 
 # xgboost – Model Spec
 xgboost_model <- boost_tree(
@@ -777,19 +661,25 @@ xgboost_model
 xgboost_params <- parameters(trees(), min_n(), tree_depth(), learn_rate())
 xgboost_params
 
+
+
+
 set.seed(123)
-xgboost_grid <- grid_max_entropy(xgboost_params, size = 30)
+xgboost_grid <- grid_max_entropy(xgboost_params, size = 4)
 xgboost_grid
 
-#xgboost – Hyperparameter Tuning
-xgb_tune <- tune_grid(diff_cases ~ ., 
-                      model =  xgboost_model,
-                      resamples = rolling_folds,
-                      metrics   = metric_set(mae, mape, rmse, rsq),
-                      grid = xgboost_grid)
-saveRDS(xgb_tune, "model.rds")
-my_model <- readRDS("model.rds")
-
+#train a challenger model once a week
+ if(wday(today(), week_start = 1) == 1){
+  #xgboost – Hyperparameter Tuning
+  challenger_tune <- tune_grid(log_cases ~ ., 
+                        model =  xgboost_model,
+                        resamples = rolling_folds,
+                        metrics   = metric_set(mae, mape, rmse, rsq),
+                        grid = xgboost_grid)
+  saveRDS(xgb_tune, "challenger_model.rds")
+  
+  xgb_tune <- readRDS("model.rds")
+}
 
 #Compare and Select Best Model
 xgb_tune %>% show_best("mae", n = 3, maximize = FALSE)
@@ -803,72 +693,89 @@ xgboost_finalized <- xgboost_model %>%
     finalize_model(params_xgboost_best)
 
 xgboost_fit <- xgboost_finalized %>%
-                fit(diff_cases ~.,
+                fit(log_cases ~.,
                     training_set)
+
+vip(xgboost_fit) +
+    labs(title = "XGBoost Model Importance")
 
 #onstep ahead forecast
 #last week for testing
-test_dates <-train_lagged %>% filter(Date > max(Date)- days(7)) %>% distinct(Date)
+test_dates <-train_lagged %>% filter(date > max(date)- days(period)) %>% distinct(date)
 test_data <- train_lagged %>%
-  filter( Date > max(Date) - days(7 + lag)) 
+  filter( date > max(date) - days(period + lag)) 
 
 i <- 1
 for(i in 1 : nrow(test_dates)){
   new_data <- test_data %>%
-              filter(Date > test_dates$Date[i] -days(8) & Date <= test_dates$Date[i])
+              filter(date > test_dates$date[i] - days(period + 1) & date <= test_dates$date[i])
   
    new_data <- new_data %>% 
-                group_by(country_id) %>% 
-                mutate_at(vars(diff_cases), funs_(lag_functions_cases)) %>%
+                group_by(country) %>% 
+                mutate_at(vars(log_cases), funs_(lag_functions_cases)) %>%
                 ungroup() %>%
-                filter(Date == test_dates$Date[i]) %>%
+                filter(date == test_dates$date[i]) %>%
                 bake(recipe_confirmedcases, new_data = .) %>%
-                select(diff_cases, everything())
+                select(log_cases, everything())
    
                 
   pred <-  xgboost_fit %>% predict(new_data = new_data) %>% pull(.pred)
   
-  test_data$diff_cases[test_data$Date == test_dates$Date[i]] <- pred
+  test_data$log_cases[test_data$date == test_dates$date[i]] <- pred
 }
 #Calculating the cumlative values
+
+#lastvalue
+last_value <- test_data %>%
+              filter(date == test_dates$date[1] - days(1)) %>%
+              mutate(last_value = confirmed + 1) %>%
+              select(country, last_value)
+
 test_data <- test_data %>%
-              filter(Date >= test_dates$Date[1] - days(1)) %>%
-              #last observation
-              mutate(diff_cases = case_when(Date == test_dates$Date[1] - days(1) ~ ConfirmedCases,#
-                                            TRUE ~ diff_cases)) %>%
-              arrange(Id) %>%
-              group_by(country_id) %>%
-              mutate(ConfirmedCases_pred = cumsum(diff_cases)) %>%
-              filter(Date >= test_dates$Date[1])
+              filter(date >= test_dates$date[1]) %>%
+              arrange(country, date) %>%
+              group_by(country) %>%
+              mutate(log_cases = exp(cumsum(log_cases))) %>%
+              ungroup() %>%  
+              inner_join(last_value, by = "country") %>%
+              mutate(pred_confirmed = log_cases * (last_value - 1))
 
 test_data %>% 
-filter(country_id == "Germany") %>%
-ggplot(aes(x = Date)) +
-  geom_line(aes(y = ConfirmedCases)) +
-  geom_line(aes(y = ConfirmedCases_pred), color = "blue")
+filter(country == "Germany") %>%
+ggplot(aes(x = date)) +
+  geom_line(aes(y = confirmed)) +
+  geom_line(aes(y = pred_confirmed), color = "blue")
+
+test_data %>% 
+  group_by(date) %>%
+  summarise(confirmed = sum(confirmed),
+            pred_confirmed = sum(pred_confirmed)) %>%
+ggplot(aes(x = date)) +
+  geom_line(aes(y = confirmed)) +
+  geom_line(aes(y = pred_confirmed), color = "blue")
 
 
 reg_metrics <- metric_set(rmse, mae, mape)
 
-perf_ml_cases <-   test_data %>%
-              group_by(country_id) %>%
-              reg_metrics(truth = ConfirmedCases, estimate = ConfirmedCases_pred) %>%
-              mutate(.metric = toupper(.metric),
-                     .model = "automl") %>%
-              pivot_wider(names_from = .metric, values_from = .estimate) %>%
-              select(-.estimator)
+perf_ml_cases_recursive <-   test_data %>%
+                              group_by(country) %>%
+                              reg_metrics(truth = confirmed, estimate = pred_confirmed) %>%
+                              mutate(.metric = toupper(.metric),
+                                     .model = "recursive_xgb") %>%
+                              pivot_wider(names_from = .metric, values_from = .estimate) %>%
+                              select(-.estimator)
 
-perf_ml_cases %>% ggplot(aes(x = MAE)) + 
-                    geom_histogram(bins = 50) +
-                    scale_x_log10()
+perf_ml_cases_recursive %>% 
+                    ggplot(aes(x = MAPE)) + 
+                    geom_histogram(bins = 50)
 
 ##Final Model (Full Dataset)
 training_set_full <-  train_lagged  %>%
   bake(recipe_confirmedcases, new_data = .) %>%
-  select(diff_cases, everything())
+  select(log_cases, everything())
 
 xgboost_fit_final <- xgboost_finalized %>%
-                     fit(diff_cases ~.,
+                     fit(log_cases ~.,
                      training_set)
 #Feature Importance
 vip(xgboost_fit_final) +
@@ -877,265 +784,134 @@ vip(xgboost_fit_final) +
 ###########################################################################
 #Final Prediction on newdata
 #onstep ahead forecast
-test_dates <- test %>% filter(Date > max(train$Date)) %>% distinct(Date)
+test_dates <- test  %>% distinct(date)
 test_data <- train_lagged %>%
-  filter( Date > max(Date) - days(lag)) %>%
-  bind_rows(test %>% filter(Date > max(train$Date)))
+  filter( date > max(date) - days(lag)) %>%
+  bind_rows(test)
 i <- 1
 
 for(i in 1 : nrow(test_dates)){
   new_data <- test_data %>%
-              filter(Date > test_dates$Date[i] -days(8) & Date <= test_dates$Date[i])
+              filter(date > test_dates$date[i] - days(period) & date <= test_dates$date[i])
    new_data <- new_data %>% 
-                group_by(country_id) %>% 
-                mutate_at(vars(diff_cases), funs_(lag_functions_cases)) %>%
+                group_by(country) %>% 
+                mutate_at(vars(log_cases), funs_(lag_functions_cases)) %>%
                 ungroup() %>%
-                filter(Date == test_dates$Date[i]) %>%
+                filter(date == test_dates$date[i]) %>%
                 bake(recipe_confirmedcases, new_data = .) %>%
-                select(diff_cases, everything())
+                select(log_cases, everything())
                 
   pred <-  xgboost_fit_final %>% predict(new_data = new_data) %>% pull(.pred)
   
-  test_data$diff_cases[test_data$Date == test_dates$Date[i]] <- pred
+  test_data$log_cases[test_data$date == test_dates$date[i]] <- pred
 }
 #Calculating the cumlative values
+#lastvalue
+last_value <- test_data %>%
+              filter(date == test_dates$date[1] - days(1)) %>%
+              mutate(last_value = confirmed + 1) %>%
+              select(country, last_value)
+
 cases_pred_ml <- test_data %>%
-              filter(Date >= test_dates$Date[1] - days(1)) %>%
-              #last observation
-              mutate(diff_cases = case_when(Date == test_dates$Date[1] - days(1) ~ ConfirmedCases,#
-                                            TRUE ~ diff_cases)) %>%
-              arrange(Id) %>%
-              group_by(country_id) %>%
-              mutate(ConfirmedCases_pred = cumsum(diff_cases)) %>%
-              filter(Date >= test_dates$Date[1])
+              filter(date >= test_dates$date[1]) %>%
+              arrange(country, date) %>%
+              group_by(country) %>%
+              mutate(log_cases = exp(cumsum(log_cases))) %>%
+              ungroup() %>%  
+              inner_join(last_value, by = "country") %>%
+              mutate(pred_confirmed = log_cases * (last_value - 1))
+
+cases_pred_ml %>% 
+filter(country == "Germany") %>%
+ggplot(aes(x = date)) +
+  geom_line(aes(y = confirmed)) +
+  geom_line(aes(y = pred_confirmed), color = "blue")
+
 
 
 ```
-## Fatalities
+## Direct Strategy
 ```{r}
-#remove confirmedcases features
-feature_names <- names(train_lagged)[ !str_detect(names(train_lagged), "cases")]
 
-train_fatalities <- train_lagged %>%
-               select(all_of(feature_names)) %>%
-               select(-c(Id,
-                         country,
-                          iso2c,
-                          day_of_first_case,
-                          year,
-                          Fatalities,
-                          ConfirmedCases,
-                          #country_id,
-                         state,
-                         Date)
-                         )
-                         
-recipe_fatalities <- recipe(diff_fatalities ~ ., train_fatalities) %>%
-  step_dummy(all_nominal(), -all_outcomes()) %>%
-  step_medianimpute(all_predictors(), -all_outcomes()) %>%
-  step_center(all_predictors(), -all_outcomes()) %>%
-  step_scale(all_predictors(), -all_outcomes()) %>%
-  prep(data = train_fatalities)   
+period
+n_countries
+lag
 
 
-period <- 14  
-training_set <-  train_lagged  %>%
-  filter(Date <= max(Date) - days(period)) %>%
-  bake(recipe_fatalities, new_data = .) %>%
-  select(diff_fatalities, everything())
+X_test <- training_set
 
-validation_set <- train_lagged %>%
-  filter(Date >  max(Date) - days(period) & Date <= max(Date)- days(7)) %>%
-  mutate(days_since_first_case = ifelse(day_of_first_case >= max(Date) - days(period), -1, days_since_first_case)) %>%
-  bake(recipe_fatalities, new_data = .) %>%
-  select(diff_fatalities, everything())  
+train_lagged$
   
-test_set <- train_lagged %>%
-  filter( Date > max(Date)- days(7)) %>%
-  mutate(days_since_first_case = ifelse(day_of_first_case >= max(Date) - days(period), -1, days_since_first_case)) %>%
-  bake(recipe_fatalities, new_data = .) %>%
-  select(diff_fatalities, everything())  
-
-#######################################################################
-h2o.init(nthreads = -1)
-
-train_hf <- as.h2o(training_set)
-valid_hf <- as.h2o(validation_set)
+xgboost_fit_final <- xgboost_finalized %>%
+  fit_xy(x = lending_club[, c("funded_amnt", "int_rate")],
+         y = lending_club$Class)
 
 
-response <- "diff_fatalities"
-features <- setdiff(colnames(train_hf), c(response))
-
-aml <- h2o.automl(x = features, 
-                  y = response,
-                  nfolds = 0,
-                  training_frame = train_hf,
-                  validation_frame = valid_hf,
-                  max_runtime_secs = 60)
-# View the AutoML Leaderboard
-lb <- aml@leaderboard
-lb
-best_model <- aml@leader
-
-h2o.saveModel(best_model, "best_model_fatalities")
-h2o.varimp(best_model)
-h2o.varimp_plot(best_model)
-
-
-#onstep ahead forecast
-#last week for testing
-test_dates <-train_lagged %>% filter(Date > max(Date)- days(7)) %>% distinct(Date)
-test_data <- train_lagged %>%
-  filter( Date > max(Date) - days(7 + lag)) 
-i <- 1
-for(i in 1 : nrow(test_dates)){
-  new_data <- test_data %>%
-              filter(Date > test_dates$Date[i] -days(8) & Date <= test_dates$Date[i])
-  
-  
-   new_data <- new_data %>% 
-                group_by(country_id) %>% 
-                mutate_at(vars(diff_fatalities), funs_(lag_functions_fatalities)) %>%
-                ungroup() %>%
-                filter(Date == test_dates$Date[i]) %>%
-                bake(recipe_fatalities, new_data = .) %>%
-                select(diff_fatalities, everything())
-   
-  new_data <- as.h2o(new_data)
-                
-  pred <-  h2o.predict(best_model, new_data[, -1]) %>% as.vector()
-
-  test_data$diff_fatalities[test_data$Date == test_dates$Date[i]] <- pred
-}
-
-test_data <- test_data %>%
-              filter(Date >= test_dates$Date[1] - days(1)) %>%
-              mutate(diff_fatalities = case_when(Date == test_dates$Date[1] - days(1) ~ Fatalities,
-                                            TRUE ~ diff_fatalities)) %>%
-              arrange(Id) %>%
-              group_by(country_id) %>%
-              mutate(Fatalities_pred = cumsum(diff_fatalities)) %>%
-              filter(Date >= test_dates$Date[1])
-
-test_data %>% 
-filter(country_id == "Germany") %>%
-ggplot(aes(x = Date)) +
-  geom_line(aes(y = Fatalities)) +
-  geom_line(aes(y = Fatalities_pred), color = "blue")
-
-
-reg_metrics <- metric_set(rmse, mae, mape)
-
-perf_h2o_fatalities <-   test_data %>%
-                          group_by(country_id) %>%
-                          reg_metrics(truth = Fatalities, estimate = Fatalities_pred) %>%
-                          mutate(.metric = toupper(.metric),
-                                 .model = "automl") %>%
-                          pivot_wider(names_from = .metric, values_from = .estimate) %>%
-                          select(-.estimator)
-
-perf_h2o_fatalities %>% ggplot(aes(x = MAE)) + 
-                    geom_histogram(bins = 50) +
-                    scale_x_log10()
-
-perf_h2o_fatalities %>% 
-  arrange(desc(MAE)) %>%
-  head()
-
-###########################################################################
-#Predict Testset
-#onstep ahead forecast
-test_dates <- test %>% filter(Date > max(train$Date)) %>% distinct(Date)
-test_data <- train_lagged %>%
-  filter( Date > max(Date) - days(lag)) %>%
-  bind_rows(test %>% filter(Date > max(train$Date)))
-i <- 1
-for(i in 1 : nrow(test_dates)){
-  new_data <- test_data %>%
-              filter(Date > test_dates$Date[i] - days(8) & Date <= test_dates$Date[i])
-  
-  
-   new_data <- new_data %>% 
-                group_by(country_id) %>% 
-                mutate_at(vars(diff_fatalities), funs_(lag_functions_fatalities)) %>%
-                ungroup() %>%
-                filter(Date == test_dates$Date[i]) %>%
-                bake(recipe_fatalities, new_data = .) %>%
-                select(diff_fatalities, everything())
-   
-  new_data <- as.h2o(new_data)
-                
-  pred <-  h2o.predict(best_model, new_data[, -1]) %>% as.vector()
-
-  test_data$diff_fatalities[test_data$Date == test_dates$Date[i]] <- pred
-}
-
-fatalities_pred_auto_ml <- test_data %>%
-                filter(Date >= test_dates$Date[1] - days(1)) %>%
-                mutate(diff_fatalities = case_when(Date == test_dates$Date[1] - days(1) ~ Fatalities,
-                                              TRUE ~ diff_fatalities)) %>%
-                arrange(Id) %>%
-                group_by(country_id) %>%
-                mutate(Fatalities_pred = cumsum(diff_fatalities)) %>%
-                filter(Date >= test_dates$Date[1]) %>%
-                ungroup()
-
+#challenger models once a week to check if it has better performance  
 
 ```
-# Time Series Models
-## ConfirmedCases
+# Time Series Models ConfirmedCases
 ```{r}
 if(F){
 period <- 7
 
-length_series <- train %>% group_by(country_id) %>%
-                  summarise( length_series = max(days_since_first_case))
+length_series <- train %>% 
+                  filter(date <= max(date) - days(period)) %>%
+                  group_by(country) %>%
+                  summarise( length_series = max(days_since_first_case),
+                              ttl_distance_measures = sum(distance_measures))
 
 
 
 train_ts <- train %>%
-            select(Id, state, country, Date, ConfirmedCases, Fatalities, country_id, day_of_first_case,  days_since_first_case, days_since_global_outbreak, distance_measures) %>%
+            select(country, date, confirmed, distance_measures) %>%
              as_tsibble(
-                index = Date,
-                key = country_id
+                index = date,
+                key = country
               )
 
 
 train_model_long <- train_ts %>%
-                    filter(Date <= max(Date) - days(period)) %>%
-                    inner_join(length_series, by = "country_id") %>%
+                    filter(date <= max(date) - days(period)) %>%
+                    inner_join(length_series, by = "country") %>%
                     filter(length_series > 7) %>%
                     model(
-                      ETS = ETS(ConfirmedCases),
-                      ARIMA = ARIMA(ConfirmedCases),
-                      ETS_LOG = ETS(log(ConfirmedCases + 1)),
-                      ARIMA_LOG = ARIMA(log(ConfirmedCases + 1)),
-                      NAIVE = NAIVE(ConfirmedCases),
-                      #NNETAR = NNETAR(ConfirmedCases),
-                      SNAIVE = SNAIVE(ConfirmedCases))
+                      ETS = ETS(confirmed),
+                      ARIMA = ARIMA(confirmed),
+                      ETS_LOG = ETS(log(confirmed + 1)),
+                      ARIMA_LOG = ARIMA(log(confirmed + 1)),
+                      NAIVE = NAIVE(confirmed),
+                      #NNETAR = NNETAR(confirmed),
+                      SNAIVE = SNAIVE(confirmed))
+
+train_forecast_long <- train_model_long %>%  
+                  forecast(h = paste0(period, " days"))
+
+best_model_long <- train_forecast_long %>%
+  fabletools::accuracy(train_ts) %>%
+  arrange(country, RMSE) %>%
+  group_by(country) %>%
+  slice(1)
 ##########################################################################
 #regarima
 train_model_regarima <- train_ts %>%
-                        filter(Date <= max(Date) - days(period)) %>%
-                        inner_join(length_series, by = "country_id") %>%
-                        filter(length_series > 7) %>%
-                        model(regarima = ARIMA(ConfirmedCases ~ distance_measures))
-
-
-
+                        filter(date <= max(date) - days(period)) %>%
+                        inner_join(length_series, by = "country") %>%
+                        filter(length_series > 7 & ttl_distance_measures > 0) %>%
+                        model(regarima = ARIMA(confirmed ~ distance_measures))
 
 new_data <- train_ts %>%
-  filter(Date == max(Date) - days(period)) %>%
-  inner_join(length_series, by = "country_id") %>%
-  filter(length_series > 7) %>%
+  filter(date == max(date) - days(period)) %>%
+  inner_join(length_series, by = "country") %>%
+  filter(length_series > 7 & ttl_distance_measures > 0) %>%
   as_tibble() %>%
-  select(country_id, distance_measures)
+  select(country, distance_measures)
 
 
 new_data <- train_ts %>%
-              filter(Date == max(Date) - days(period)) %>%
+              filter(date == max(date) - days(period)) %>%
               new_data(., period) %>%
-              inner_join(new_data, by = "country_id")
+              inner_join(new_data, by = "country")
 
 train_forecast_regarima <- train_model_regarima %>% forecast(new_data)
 
@@ -1145,41 +921,33 @@ best_model_regarima <- train_forecast_regarima %>%
 
 ####################################################  
 
-train_model_short <- train_ts %>%
-  filter(Date <= max(Date) - days(period)) %>%
-  inner_join(length_series, by = "country_id") %>%
-  filter(length_series <= 7) %>%
-  model(
-    ETS = ETS(ConfirmedCases),
-    ARIMA = ARIMA(ConfirmedCases),
-    NAIVE = NAIVE(ConfirmedCases),
-    SNAIVE = SNAIVE(ConfirmedCases)
-  )
-
-train_forecast_long <- train_model_long %>%  
-                  forecast(h = paste0(period, " days"))
-
-train_forecast_short <- train_model_short %>%  
-                        forecast(h = paste0(period, " days"))
+# train_model_short <- train_ts %>%
+#   filter(Date <= max(Date) - days(period)) %>%
+#   inner_join(length_series, by = "country_id") %>%
+#   filter(length_series <= 7) %>%
+#   model(
+#     ETS = ETS(ConfirmedCases),
+#     ARIMA = ARIMA(ConfirmedCases),
+#     NAIVE = NAIVE(ConfirmedCases),
+#     SNAIVE = SNAIVE(ConfirmedCases)
+#   )
 
 
-best_model_long <- train_forecast_long %>%
-  fabletools::accuracy(train_ts) %>%
-  arrange(country_id, RMSE) %>%
-  group_by(country_id) %>%
-  slice(1)
 
-best_model_short<- train_forecast_short %>%
-  fabletools::accuracy(train_ts) %>%
-  arrange(country_id, RMSE) %>%
-  group_by(country_id) %>%
-  slice(1)
+# train_forecast_short <- train_model_short %>%  
+#                         forecast(h = paste0(period, " days"))
+
+# best_model_short<- train_forecast_short %>%
+#   fabletools::accuracy(train_ts) %>%
+#   arrange(country_id, RMSE) %>%
+#   group_by(country_id) %>%
+#   slice(1)
 
 best_model_cases <- best_model_long %>%
                     #bind_rows(best_model_short) %>%
                     bind_rows(best_model_regarima) %>%
-                    arrange(country_id, RMSE) %>%
-                    group_by(country_id) %>%
+                    arrange(country, RMSE) %>%
+                    group_by(country) %>%
                     slice(1)
 
 write.csv(best_model_cases, "train_performance.csv", row.names = FALSE)
@@ -1197,15 +965,15 @@ best_model_cases %>% ggplot(aes(x = MAPE)) +
 best_model_cases %>% ggplot(aes(x = .model)) + geom_bar()
                     
 #fit all models on whole dataset and forecast number of days in test set
-period <-  as.numeric(difftime(max(test$Date), min(test$Date), units = "days")) + 1 
+period <-  as.numeric(difftime(max(test$date), min(test$date), units = "days")) + 1 
 
-pred_best_model_ts <- function(x, target = " ConfirmedCases"){
-model_country <- best_model_cases %>% filter(.model == x) %>% pull(country_id)
+pred_best_model_ts <- function(x, target = "confirmed"){
+model_country <- best_model_cases %>% filter(.model == x) %>% pull(country)
 #log models
   if(str_detect("ETS_LOG","LOG")){
     x <- str_replace(x,"_LOG","")
       model <- train_ts %>%
-        filter(country_id %in% model_country ) %>%
+        filter(country %in% model_country ) %>%
         model(x = eval(parse(text = x))(log(!! sym(target) + 1))) %>% 
         forecast(h = paste0(period, " days")) %>%
         as.data.frame() %>%
@@ -1213,7 +981,7 @@ model_country <- best_model_cases %>% filter(.model == x) %>% pull(country_id)
         select(1 : 4)
   } else {
         model <- train_ts %>%
-        filter(country_id %in% model_country ) %>%
+        filter(country %in% model_country ) %>%
         model(x = eval(parse(text = x))(!! sym(target))) %>% 
         forecast(h = paste0(period, " days")) %>%
         as.data.frame() %>%
@@ -1230,23 +998,23 @@ if(F){
   ##pred regarima best_model
 regarima_coutries <- best_model_cases %>%
                       filter(.model =="regarima") %>%
-                      pull(country_id)
+                      pull(country)
 
 train_model_regarima <- train_ts %>%
-                        filter(country_id %in% regarima_coutries) %>%
+                        filter(country %in% regarima_coutries) %>%
                         model(regarima = ARIMA(ConfirmedCases ~ distance_measures))
 
 
 new_data <- train_ts %>%
-  filter(Date == max(Date) & country_id %in% regarima_coutries) %>%
+  filter(date == max(date) & country %in% regarima_coutries) %>%
   as_tibble() %>%
-  select(country_id, distance_measures)
+  select(country, distance_measures)
 
 
 new_data <- train_ts %>%
-              filter(Date == max(Date)) %>%
+              filter(date == max(date)) %>%
               new_data(., period) %>%
-              inner_join(new_data, by = "country_id")
+              inner_join(new_data, by = "country")
 
 regarima_pred <- train_model_regarima %>%
                            forecast(new_data) %>%
@@ -1255,7 +1023,7 @@ regarima_pred <- train_model_regarima %>%
 #remaing models   
   
   final_pred <- map_df(
-    unique(best_model_cases$.model)[unique(best_model_cases$.model) != "regarima"], pred_best_model_ts, "ConfirmedCases")
+    unique(best_model_cases$.model)[unique(best_model_cases$.model) != "regarima"], pred_best_model_ts, "confirmed")
   
 final_pred <-  final_pred %>% 
                 bind_rows(regarima_pred)
@@ -1266,122 +1034,20 @@ final_pred <-  final_pred %>%
 
 
 ```
-# Fatalities
-```{r}
-  if(F){
-length_series<- train %>% 
-    filter(Fatalities > 0) %>%
-    group_by(country_id) %>%
-    summarise(length_series = n())
-  
-  period <- 7
-  
-  train_model_long <- train_ts %>%
-    filter(Date <= max(Date) - days(period)) %>%
-    inner_join(length_series, by = "country_id") %>%
-    filter(length_series > 7) %>%
-    model(
-      ETS = ETS(Fatalities),
-      ARIMA = ARIMA(Fatalities),
-      NAIVE = NAIVE(Fatalities),
-      SNAIVE = SNAIVE(Fatalities),
-      NNETAR = NNETAR(Fatalities))
-  
-  train_model_short <- train_ts %>%
-    filter(Date <= max(Date) - days(period)) %>%
-    inner_join(length_series, by = "country_id") %>%
-    filter(length_series <= 7) %>%
-    model(
-      ETS = ETS(Fatalities),
-      ARIMA = ARIMA(Fatalities),
-      NAIVE = NAIVE(Fatalities),
-      SNAIVE = SNAIVE(Fatalities)
-    )
-  
-  train_forecast_long <- train_model_long %>%  
-    forecast(h = paste0(period, " days"))
-  
-  train_forecast_short <- train_model_short %>%  
-    forecast(h = paste0(period, " days"))
-  
-  
-  best_model_long <- train_forecast_long %>%
-    fabletools::accuracy(train_ts) %>%
-    arrange(country_id, RMSE) %>%
-    group_by(country_id) %>%
-    slice(1)
-  
-  best_model_short<- train_forecast_short %>%
-    fabletools::accuracy(train_ts) %>%
-    arrange(country_id, RMSE) %>%
-    group_by(country_id) %>%
-    slice(1)
-  
-  best_model_fatalities <- best_model_long %>%
-    bind_rows(best_model_short)
-    
-  write.csv(best_model_fatalities, "train_performance_fatalities.csv", row.names = FALSE)
-  } else{
-    best_model_fatalities <- read_csv("train_performance_fatalities.csv")
-  } 
-  
-  best_model_fatalities %>% ggplot(aes(x = MAE)) + 
-    geom_histogram(bins = 50) +
-    scale_x_log10()
-  
-  best_model_fatalities %>% ggplot(aes(x = MAPE)) + 
-    geom_histogram(bins = 50)
-  
-  
-  best_model_fatalities %>% ggplot(aes(x = .model)) + geom_bar()
-  
-  #fit all models on whole dataset and forecast number of days in test set
-  period <-  as.numeric(difftime(max(test$Date), min(test$Date), units = "days")) + 1 
-  
-  pred_best_model_ts <- function(x){
-    model_country <- best_model_fatalities %>% filter(.model == x) %>% pull(country_id)
-    train_ts %>%
-      filter(country_id %in% model_country ) %>%
-      model(x = eval(parse(text = x))(Fatalities)) %>% 
-      forecast(h = paste0(period, " days")) %>%
-      as.data.frame() %>%
-      mutate(.model = x) %>%
-      select(1 : 4)
-  }
-  
-  if(F){
-    final_pred <- map_df(unique(best_model_fatalities$.model), pred_best_model_ts)
-    write.csv(final_pred, "prediction_ts_fatalities.csv", row.names = FALSE)
-  } else {
-    final_pred_fatalities <- read_csv("prediction_ts_fatalities.csv")
-  }
 
-
-```
 # Model Comparison
 ```{r}
 
 best_model_cases <- best_model_cases %>% 
-                    bind_rows(perf_ml_cases) %>%
-                    arrange(country_id, RMSE) %>%
-                    group_by(country_id) %>%
+                    bind_rows(perf_ml_cases_recursive) %>%
+                    arrange(country, RMSE) %>%
+                    group_by(country) %>%
                     slice(1)
 
 best_model_cases %>% 
   ggplot(aes(x = .model)) +
   geom_bar() + 
   ggtitle("Best Model Confirmed Cases")
-
-best_model_fatalities <- best_model_fatalities %>% 
-                    bind_rows(perf_h2o_fatalities) %>%
-                    arrange(country_id, RMSE) %>%
-                    group_by(country_id) %>%
-                    slice(1)
-
-best_model_fatalities %>% 
-  ggplot(aes(x = .model)) +
-  geom_bar() + 
-  ggtitle("Best Model Fatalities")
 
 
 ```
