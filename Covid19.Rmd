@@ -32,11 +32,14 @@ library(corrplot)
 library(ggthemes)
 library(zoo)
 library(anomalize)
+library(vip)
 library(tidycovid19)
 
 theme_set(theme_minimal())
 
-
+#setting parameters
+sub_set <- TRUE # only train on subset of the data
+retrain_ts <- FALSE # retrain time series models
 
 covid <- read_csv("data/covid19.csv")
 
@@ -72,10 +75,11 @@ set.seed(123)
 sampled_id <- unique(train$country )[sample(1 : length(unique(train$country)), 10)]
 sampled_id <- c(sampled_id, "Italy", "France", "Germany", "Sweden", "US", "Thailand", "China", "Afghanistan")
 
-# train <- train %>% filter(country %in% sampled_id)
-# 
-# test <- test %>% filter(country %in% sampled_id)
+if(sub_set){
+train <- train %>% filter(country %in% sampled_id)
 
+test <- test %>% filter(country %in% sampled_id)
+}
 
 ```
 
@@ -159,10 +163,13 @@ wdi_agg <- wdi_agg %>% select(all_of(vars))
 
 #combine timeseries and wdia data
 train <- train %>% 
-         left_join(wdi_agg, by ="iso3c")
+         left_join(wdi_agg, by ="iso3c") %>%
+         filter(!is.na(region))
 
 test <- test %>% 
-         left_join(wdi_agg, by ="iso3c")
+        left_join(wdi_agg, by ="iso3c") %>%
+        filter(!is.na(region))
+
 
 #calculaute per 100K
 k <- 10 ^ 5
@@ -258,7 +265,7 @@ train %>%
 gov <- read_csv("data/gov.csv")
 
 #download new data if available
-if(max(gov$timestamp) < today() - days(1) ){
+if(max(as.Date(gov$timestamp)) < today() - days(1) ){
 
   gov_new <- download_acaps_npi_data() 
   
@@ -493,10 +500,6 @@ train %>%
 
 train  %>% plot_missing()
 
-
-
-#test <- test %>% left_join(wdi_agg %>% select(-c(year, region)), by = "iso2c")
-
 ```
 ## Goverment Inventions
 ```{r}
@@ -566,10 +569,24 @@ train <- train %>%
         group_by(country) %>%
         arrange(country, date) %>%
         mutate(log_cases = log(confirmed + 1),
-                log_cases = log_cases - lag(log_cases)) %>%
+                log_cases = log_cases - lag(log_cases),
+               rolling_mean_7 = rollapply(log_cases,
+                                mean, align = "right", fill = NA, width = list(-(7:1)))) %>%
         mutate_at(vars(log_cases), funs_(lag_functions_cases)) %>%
         ungroup()
 
+test <- test %>%
+        bind_rows(train,.id = "data_set") %>% # combine with train to calculate the lags
+        group_by(country) %>%
+        arrange(country, date) %>%
+        mutate(log_cases = log(confirmed + 1),
+                log_cases = log_cases - lag(log_cases),
+                rolling_mean_7 = rollapply(log_cases,
+                                mean, align = "right", fill = NA, width = list(-(7:1)))) %>%
+        mutate_at(vars(log_cases), funs_(lag_functions_cases)) %>%
+        ungroup() %>%
+        filter(data_set == 1) %>%
+        select(-data_set)
 
 
 #combine lagged features with training data
@@ -588,7 +605,7 @@ col_rem <- c("country", "iso3c", "date", "deaths", "timestamp", "day_of_first_ca
 train_cases <- train_lagged %>%
                select(- all_of(col_rem))
          
-                         
+#prepare data for modelling                         
 recipe_confirmedcases <- recipe(log_cases ~ ., train_cases) %>%
   step_medianimpute(all_numeric(), -all_outcomes()) %>%
   step_center(all_numeric(), -all_outcomes()) %>%
@@ -596,25 +613,18 @@ recipe_confirmedcases <- recipe(log_cases ~ ., train_cases) %>%
   step_zv(all_predictors(), -all_outcomes()) %>%
   step_dummy(all_nominal(), -all_outcomes()) %>%
   prep(data = train_cases)   
-###
+
+
 training_set <-  train_lagged  %>%
-  filter(date <= max(date) - days(period)) %>%
+  #filter(date <= max(date) - days(period)) %>%
   select(- all_of(col_rem)) %>%
   bake(recipe_confirmedcases, new_data = .) %>%
   select(log_cases, everything())
 
-test_set <- train_lagged %>%
-  filter( date > max(date)- days(period)) %>%
-  mutate(days_since_first_case = ifelse(day_of_first_case >= max(date) - days(period), -1,   days_since_first_case)) %>%
-  select(- all_of(col_rem)) %>% 
-  bake(recipe_confirmedcases, new_data = .) %>%
-  select(log_cases, everything()) 
-
-#show Folds (Date Column is required)
+#show Folds for training (Date Column is required)
 n_countries <- train_lagged %>% distinct(country) %>% nrow()
-init <- 27
+init <- 35
 rolling_folds <- train_lagged  %>%
-                 filter(date <= max(date) - days(period)) %>%
                  rolling_origin(.,
                                 initial =  init * n_countries,
                                 assess =  7 * n_countries,
@@ -630,9 +640,8 @@ for(i in 1: length(rolling_folds$splits)){
   print(paste0("Fold ", i))
   print(paste0("Modelling ", model_from, " - ", model_to ))
   print(paste0("Assesment ", assesment_from, " - ", assesment_to ))
-
 }
-####
+
 
 
 #Create Folds for modeling excluding date column
@@ -661,25 +670,37 @@ xgboost_model
 xgboost_params <- parameters(trees(), min_n(), tree_depth(), learn_rate())
 xgboost_params
 
-
-
-
 set.seed(123)
-xgboost_grid <- grid_max_entropy(xgboost_params, size = 4)
+xgboost_grid <- grid_max_entropy(xgboost_params, size = 30)
 xgboost_grid
 
 #train a challenger model once a week
- if(wday(today(), week_start = 1) == 1){
+train_challenger <- wday(today(), week_start = 1) == 1
+ if(train_challenger){
   #xgboost – Hyperparameter Tuning
   challenger_tune <- tune_grid(log_cases ~ ., 
                         model =  xgboost_model,
                         resamples = rolling_folds,
                         metrics   = metric_set(mae, mape, rmse, rsq),
                         grid = xgboost_grid)
-  saveRDS(xgb_tune, "challenger_model.rds")
+  saveRDS(challenger_tune, "models/challenger_model.rds")
   
-  xgb_tune <- readRDS("model.rds")
-}
+# select best params  
+params_challenger_best <- challenger_tune %>% 
+    select_best("mae", maximize = FALSE)
+
+#Finalize the Model for testing
+challenger_finalized <- xgboost_model %>% 
+    finalize_model(params_challenger_best)
+
+challenger_fit <- challenger_finalized %>%
+                fit(log_cases ~.,
+                    training_set)
+  
+ }
+
+#read model
+xgb_tune <- readRDS("models/model.rds")
 
 #Compare and Select Best Model
 xgb_tune %>% show_best("mae", n = 3, maximize = FALSE)
@@ -699,39 +720,41 @@ xgboost_fit <- xgboost_finalized %>%
 vip(xgboost_fit) +
     labs(title = "XGBoost Model Importance")
 
-#onstep ahead forecast
-#last week for testing
-test_dates <-train_lagged %>% filter(date > max(date)- days(period)) %>% distinct(date)
-test_data <- train_lagged %>%
-  filter( date > max(date) - days(period + lag)) 
 
+#check performance on test data
+#onstep ahead forecast
+recursive_pred <- function(model){
+test_dates <- test  %>% distinct(date)
+test_data <- train_lagged %>%
+  filter( date > max(date) - days(lag)) %>%
+  bind_rows(test)
 i <- 1
+
 for(i in 1 : nrow(test_dates)){
   new_data <- test_data %>%
-              filter(date > test_dates$date[i] - days(period + 1) & date <= test_dates$date[i])
-  
+              filter(date > test_dates$date[i] - days(period) & date <= test_dates$date[i])
    new_data <- new_data %>% 
                 group_by(country) %>% 
+                mutate(rolling_mean_7 = rollapply(log_cases,
+                                mean, align = "right", fill = NA, width = list(-(7:1)))) %>%
                 mutate_at(vars(log_cases), funs_(lag_functions_cases)) %>%
                 ungroup() %>%
                 filter(date == test_dates$date[i]) %>%
                 bake(recipe_confirmedcases, new_data = .) %>%
                 select(log_cases, everything())
-   
                 
-  pred <-  xgboost_fit %>% predict(new_data = new_data) %>% pull(.pred)
+  pred <-  model %>% predict(new_data = new_data) %>% pull(.pred)
   
   test_data$log_cases[test_data$date == test_dates$date[i]] <- pred
 }
 #Calculating the cumlative values
-
 #lastvalue
 last_value <- test_data %>%
               filter(date == test_dates$date[1] - days(1)) %>%
               mutate(last_value = confirmed + 1) %>%
               select(country, last_value)
 
-test_data <- test_data %>%
+cases_pred_ml <- test_data %>%
               filter(date >= test_dates$date[1]) %>%
               arrange(country, date) %>%
               group_by(country) %>%
@@ -740,24 +763,40 @@ test_data <- test_data %>%
               inner_join(last_value, by = "country") %>%
               mutate(pred_confirmed = log_cases * (last_value - 1))
 
-test_data %>% 
+return(cases_pred_ml)
+}
+
+cases_pred_ml <- recursive_pred(xgboost_fit)
+
+
+cases_pred_ml %>% 
 filter(country == "Germany") %>%
 ggplot(aes(x = date)) +
-  geom_line(aes(y = confirmed)) +
-  geom_line(aes(y = pred_confirmed), color = "blue")
+  geom_line(aes(y = confirmed, color = "truth")) +
+  geom_line(aes(y = pred_confirmed, color ="forecast")) +
+  scale_color_manual(values = c(
+    'truth' = 'darkblue',
+    'forecast' = 'darkorange')) +
+  labs(color = '') +
+  ggtitle("Forecast Germany xgboost recursive")
 
-test_data %>% 
+cases_pred_ml %>% 
   group_by(date) %>%
   summarise(confirmed = sum(confirmed),
             pred_confirmed = sum(pred_confirmed)) %>%
 ggplot(aes(x = date)) +
-  geom_line(aes(y = confirmed)) +
-  geom_line(aes(y = pred_confirmed), color = "blue")
+  geom_line(aes(y = confirmed, color = "truth")) +
+  geom_line(aes(y = pred_confirmed, color ="forecast")) +
+  scale_color_manual(values = c(
+    'truth' = 'darkblue',
+    'forecast' = 'darkorange')) +
+  labs(color = '') +
+  ggtitle("Forecast world-wide xgboost recursive")
 
 
 reg_metrics <- metric_set(rmse, mae, mape)
 
-perf_ml_cases_recursive <-   test_data %>%
+perf_ml_cases_recursive <-   cases_pred_ml %>%
                               group_by(country) %>%
                               reg_metrics(truth = confirmed, estimate = pred_confirmed) %>%
                               mutate(.metric = toupper(.metric),
@@ -769,25 +808,80 @@ perf_ml_cases_recursive %>%
                     ggplot(aes(x = MAPE)) + 
                     geom_histogram(bins = 50)
 
+#check if challenger model has a better performance
+
+ if(train_challenger){
+   
+    cases_pred_challenger <- recursive_pred(challenger_fit) 
+    
+   mae_orig_model <- cases_pred_ml %>%
+   reg_metrics(truth = confirmed, estimate = pred_confirmed) %>%
+   mutate(.metric = toupper(.metric),
+   .model = "recursive_xgb") %>%
+   pivot_wider(names_from = .metric, values_from = .estimate) %>%
+   select(-.estimator) %>%
+   pull(MAE)    
+     
+   mae_challenger_model <- cases_pred_challenger %>%
+   reg_metrics(truth = confirmed, estimate = pred_confirmed) %>%
+   mutate(.metric = toupper(.metric),
+   .model = "recursive_xgb") %>%
+   pivot_wider(names_from = .metric, values_from = .estimate) %>%
+   select(-.estimator) %>%
+   pull(MAE) 
+   
+   #replace old model if challenger performs better
+   if(mae_challenger_model < mae_orig_model){
+    
+    #save old model with timestamp
+     saveRDS(xgb_tune, paste0("models/", today(),"_model.rds"))
+    #save new prod model 
+     saveRDS(challenger_tune, "models/model.rds")
+     
+    xgb_tune <- challenger_tune 
+    xgboost_fit <- challenger_fit 
+     
+   }
+     
+ }
+
+### fit model on whole dataset and make prediction for the future
 ##Final Model (Full Dataset)
+params_xgboost_best <- xgb_tune %>% 
+    select_best("mae", maximize = FALSE)
+
+#Finalize the Model for testing
+xgboost_finalized <- xgboost_model %>% 
+    finalize_model(params_xgboost_best)
+
+
 training_set_full <-  train_lagged  %>%
+  bind_rows(test) %>%
   bake(recipe_confirmedcases, new_data = .) %>%
   select(log_cases, everything())
 
 xgboost_fit_final <- xgboost_finalized %>%
                      fit(log_cases ~.,
-                     training_set)
-#Feature Importance
-vip(xgboost_fit_final) +
-    labs(title = "XGBoost Model Importance") 
+                     training_set_full)
 
-###########################################################################
-#Final Prediction on newdata
-#onstep ahead forecast
-test_dates <- test  %>% distinct(date)
-test_data <- train_lagged %>%
+vip(xgboost_fit_final) +
+    labs(title = "XGBoost Model Importance")
+
+
+# forecast 14 days
+test_dates <- data.frame(date = seq(max(test$date) + days(1), by = "days", length.out = 14))
+
+#create prediction dataframe
+pred_data <- test %>% 
+             filter(date == max(date)) %>%
+             select(-date) %>%
+             crossing(test_dates) %>%
+             arrange(date, country)
+
+
+test_data <- test %>%
   filter( date > max(date) - days(lag)) %>%
-  bind_rows(test)
+  bind_rows(pred_data)
 i <- 1
 
 for(i in 1 : nrow(test_dates)){
@@ -821,42 +915,299 @@ cases_pred_ml <- test_data %>%
               inner_join(last_value, by = "country") %>%
               mutate(pred_confirmed = log_cases * (last_value - 1))
 
+##todo add last two weeks e.g. test data
 cases_pred_ml %>% 
 filter(country == "Germany") %>%
 ggplot(aes(x = date)) +
-  geom_line(aes(y = confirmed)) +
-  geom_line(aes(y = pred_confirmed), color = "blue")
+  geom_line(aes(y = pred_confirmed), color = "darkblue") +
+  ggtitle("Forecast Germany 14 Days ahead") +
+  ylab("Predicted Confirmed Cases")
 
+cases_pred_ml %>% 
+  group_by(date) %>%
+  summarise(pred_confirmed = sum(pred_confirmed)) %>%
+ggplot(aes(x = date)) +
+  geom_line(aes(y = pred_confirmed), color = "darkblue") + 
+  ggtitle("Forecast world-wide 14 Days ahead") +
+  ylab("Predicted Confirmed Cases")
 
 
 ```
 ## Direct Strategy
 ```{r}
 
+# period
+# n_countries
+# lag
+# #order matters,  the data is ordered by date first than by country
+# X_train <-  train_lagged  %>%
+#   filter(date <= max(date) - days(period)) %>%
+#   select(- all_of(col_rem)) %>%
+#   bake(recipe_confirmedcases, new_data = .) %>%
+#   select(log_cases, everything())
+# 
+# y_train <- X_train$log_cases
+# 
+# #the test set consisting
+# # of the  most recent values of the training set. It's the
+# # same for all models.
+# X_test <-  train_lagged  %>%
+#   filter(date == max(date) - days(period)) %>%
+#   select(- all_of(col_rem)) %>%
+#   bake(recipe_confirmedcases, new_data = .) %>%
+#   select(log_cases, everything())
+# 
+#   
+# forecasts_direct <- train_lagged %>% 
+#                     filter(date > max(date) - days(period)) %>%
+#                     select(date, country, log_cases, confirmed) %>%
+#                     mutate(pred = as.numeric(NA))
+# 
+# i <- 1
+# from <- 1
+# to  <- n_countries
+# for(i in 1 : period){
+#   print(i)
+#     # fit the model
+#   fit_rf <- randomForest(X_train[, -1], y_train)
+# 
+#   # predict using the test set
+#   forecasts_direct[from : to, "pred"] <- predict(fit_rf, X_test)
+#   
+#   # here is where we repeatedly reshape the training data to reflect the time distance
+#   # corresponding to the current forecast horizon.
+#   y_train <- y_train[-(1 : n_countries)] 
+#   
+#   X_train <- X_train[-(nrow(X_train) :(nrow(X_train) - n_countries + 1)), ] 
+#   
+#   from <- from + n_countries
+#   to  <- to + n_countries
+#   
+# }
+#   
+# #Calculating the cumlative values
+# #lastvalue
+# last_value <- train_lagged  %>%
+#               filter(date == max(date) - days(period))%>%
+#               mutate(last_value = confirmed + 1) %>%
+#               select(country, last_value)
+# 
+# cases_pred_ml_direct <- forecasts_direct %>%
+#                         arrange(country, date) %>%
+#                         group_by(country) %>%
+#                         mutate(log_cases = exp(cumsum(pred))) %>%
+#                         ungroup() %>%  
+#                         inner_join(last_value, by = "country") %>%
+#                         mutate(pred_confirmed = log_cases * (last_value - 1))
+# 
+# performance_direct <- cases_pred_ml_direct %>%
+#                       group_by(country) %>%
+#                        reg_metrics(truth = confirmed, estimate = pred_confirmed) %>%
+#                        mutate(.metric = toupper(.metric),
+#                        .model = "direct_rf") %>%
+#                        pivot_wider(names_from = .metric, values_from = .estimate) %>%
+#                        select(-.estimator)
+# 
+# cases_pred_ml_direct %>% 
+# filter(country == "Germany") %>%
+# ggplot(aes(x = date)) +
+#   geom_line(aes(y = confirmed )) +
+#   geom_line(aes(y = pred_confirmed), color = "blue") +
+#   ggtitle("Forecast Germany")
+# 
+# cases_pred_ml_direct %>% 
+#   group_by(date) %>%
+#   summarise(confirmed = sum(confirmed),
+#     pred_confirmed = sum(pred_confirmed)) %>%
+# ggplot(aes(x = date)) +
+# geom_line(aes(y = confirmed )) +
+#   geom_line(aes(y = pred_confirmed), color = "blue") + 
+#   ggtitle("Forecast world-wide")
+#boosting model
+
+#########
+#boosting
+
 period
 n_countries
 lag
+#order matters,  the data is ordered by date first than by country
+X_train <-  train_lagged  %>%
+  filter(date <= max(date) - days(period)) %>%
+  select(- all_of(col_rem)) %>%
+  bake(recipe_confirmedcases, new_data = .) %>%
+  select(log_cases, everything())
 
+y_train <- X_train$log_cases
 
-X_test <- training_set
+#the test set consisting
+# of the  most recent values of the training set. It's the
+# same for all models.
+X_test <-  train_lagged  %>%
+  filter(date == max(date) - days(period)) %>%
+  select(- all_of(col_rem)) %>%
+  bake(recipe_confirmedcases, new_data = .) %>%
+  select(log_cases, everything())
 
-train_lagged$
   
-xgboost_fit_final <- xgboost_finalized %>%
-  fit_xy(x = lending_club[, c("funded_amnt", "int_rate")],
-         y = lending_club$Class)
+forecasts_direct <- train_lagged %>% 
+                    filter(date > max(date) - days(period)) %>%
+                    select(date, country, log_cases, confirmed) %>%
+                    mutate(pred = as.numeric(NA))
 
+i <- 1
+from <- 1
+to  <- n_countries
+for(i in 1 : period){
+  print(i)
+    # fit the model
+  fit_rf <- xgboost_finalized %>%
+  fit_xy(x = X_train[, -1],
+         y = y_train)
 
-#challenger models once a week to check if it has better performance  
+  # predict using the test set
+  forecasts_direct[from : to, "pred"] <- fit_rf %>% predict(new_data = X_test[,-1]) %>% pull(.pred)
+  
+  # here is where we repeatedly reshape the training data to reflect the time distance
+  # corresponding to the current forecast horizon.
+  y_train <- y_train[-(1 : n_countries)] 
+  
+  X_train <- X_train[-(nrow(X_train) :(nrow(X_train) - n_countries + 1)), ] 
+  
+  from <- from + n_countries
+  to  <- to + n_countries
+  
+}
+  
+#Calculating the cumlative values
+#lastvalue
+last_value <- train_lagged  %>%
+              filter(date == max(date) - days(period))%>%
+              mutate(last_value = confirmed + 1) %>%
+              select(country, last_value)
+
+cases_pred_ml_direct <- forecasts_direct %>%
+                        arrange(country, date) %>%
+                        group_by(country) %>%
+                        mutate(log_cases = exp(cumsum(pred))) %>%
+                        ungroup() %>%  
+                        inner_join(last_value, by = "country") %>%
+                        mutate(pred_confirmed = log_cases * (last_value - 1))
+
+performance_direct <- cases_pred_ml_direct %>%
+                      group_by(country) %>%
+                       reg_metrics(truth = confirmed, estimate = pred_confirmed) %>%
+                       mutate(.metric = toupper(.metric),
+                       .model = "direct_rf") %>%
+                       pivot_wider(names_from = .metric, values_from = .estimate) %>%
+                       select(-.estimator)
+
+cases_pred_ml_direct %>% 
+filter(country == "Germany") %>%
+ggplot(aes(x = date)) +
+  geom_line(aes(y = confirmed )) +
+  geom_line(aes(y = pred_confirmed), color = "blue") +
+  ggtitle("Forecast Germany")
+
+cases_pred_ml_direct %>% 
+  group_by(date) %>%
+  summarise(confirmed = sum(confirmed),
+    pred_confirmed = sum(pred_confirmed)) %>%
+ggplot(aes(x = date)) +
+geom_line(aes(y = confirmed )) +
+  geom_line(aes(y = pred_confirmed), color = "blue") + 
+  ggtitle("Forecast world-wide")
+
+# fit model on whole dataset and make prediction for the future
+X_train <-  train_lagged  %>%
+  bind_rows(test) %>%
+  select(- all_of(col_rem)) %>%
+  bake(recipe_confirmedcases, new_data = .) %>%
+  select(log_cases, everything())
+y_train <- X_train$log_cases
+
+#the test set consisting
+# of the  most recent values of the training set. It's the
+# same for all models.
+X_test <-  train_lagged  %>%
+  bind_rows(test) %>%
+  filter(date == max(date) - days(period)) %>%
+  select(- all_of(col_rem)) %>%
+  bake(recipe_confirmedcases, new_data = .) %>%
+  select(log_cases, everything())
+
+# forecast 14 days
+test_dates <- data.frame(date = seq(max(test$date) + days(1), by = "days", length.out = 14))
+
+  
+forecasts_direct <- train_lagged %>% 
+                    distinct(country) %>%
+                    crossing(test_dates) %>%
+                    arrange(date, country) %>%
+                    select(date, country) %>%
+                    mutate(pred = as.numeric(NA))
+
+i <- 1
+from <- 1
+to  <- n_countries
+for(i in 1 : period){
+  print(i)
+    # fit the model
+  fit_rf <- xgboost_finalized %>%
+  fit_xy(x = X_train[, -1],
+         y = y_train)
+
+  # predict using the test set
+  forecasts_direct[from : to, "pred"] <- fit_rf %>% predict(new_data = X_test[,-1]) %>% pull(.pred)
+  
+  # here is where we repeatedly reshape the training data to reflect the time distance
+  # corresponding to the current forecast horizon.
+  y_train <- y_train[-(1 : n_countries)] 
+  
+  X_train <- X_train[-(nrow(X_train) :(nrow(X_train) - n_countries + 1)), ] 
+  
+  from <- from + n_countries
+  to  <- to + n_countries
+  
+}
+  
+#Calculating the cumlative values
+#lastvalue
+last_value <- train_lagged  %>%
+              bind_rows(test) %>%
+              filter(date == max(date) - days(period))%>%
+              mutate(last_value = confirmed + 1) %>%
+              select(country, last_value)
+
+cases_pred_ml_direct <- forecasts_direct %>%
+                        arrange(country, date) %>%
+                        group_by(country) %>%
+                        mutate(log_cases = exp(cumsum(pred))) %>%
+                        ungroup() %>%  
+                        inner_join(last_value, by = "country") %>%
+                        mutate(pred_confirmed = log_cases * (last_value - 1))
+
+cases_pred_ml_direct %>% 
+filter(country == "Germany") %>%
+ggplot(aes(x = date)) +
+  geom_line(aes(y = pred_confirmed), color = "blue") +
+  ggtitle("Forecast Germany")
+
+cases_pred_ml_direct %>% 
+  group_by(date) %>%
+  summarise(pred_confirmed = sum(pred_confirmed)) %>%
+ggplot(aes(x = date)) +
+  geom_line(aes(y = pred_confirmed), color = "blue") + 
+  ggtitle("Forecast world-wide")
+
 
 ```
 # Time Series Models ConfirmedCases
 ```{r}
-if(F){
+if(retrain_ts){
 period <- 7
 
 length_series <- train %>% 
-                  filter(date <= max(date) - days(period)) %>%
                   group_by(country) %>%
                   summarise( length_series = max(days_since_first_case),
                               ttl_distance_measures = sum(distance_measures))
@@ -870,9 +1221,15 @@ train_ts <- train %>%
                 key = country
               )
 
+test_ts <- test %>%
+            select(country, date, confirmed, distance_measures) %>%
+             as_tsibble(
+                index = date,
+                key = country
+              )
+
 
 train_model_long <- train_ts %>%
-                    filter(date <= max(date) - days(period)) %>%
                     inner_join(length_series, by = "country") %>%
                     filter(length_series > 7) %>%
                     model(
@@ -881,27 +1238,28 @@ train_model_long <- train_ts %>%
                       ETS_LOG = ETS(log(confirmed + 1)),
                       ARIMA_LOG = ARIMA(log(confirmed + 1)),
                       NAIVE = NAIVE(confirmed),
-                      #NNETAR = NNETAR(confirmed),
+                      NNETAR = NNETAR(confirmed),
                       SNAIVE = SNAIVE(confirmed))
 
 train_forecast_long <- train_model_long %>%  
                   forecast(h = paste0(period, " days"))
+write_csv(train_forecast_long, "data/train_forecast_long.csv")
+
 
 best_model_long <- train_forecast_long %>%
-  fabletools::accuracy(train_ts) %>%
-  arrange(country, RMSE) %>%
-  group_by(country) %>%
-  slice(1)
+  fabletools::accuracy(test_ts) %>%
+  arrange(country, RMSE) 
+
+
 ##########################################################################
 #regarima
 train_model_regarima <- train_ts %>%
-                        filter(date <= max(date) - days(period)) %>%
                         inner_join(length_series, by = "country") %>%
                         filter(length_series > 7 & ttl_distance_measures > 0) %>%
                         model(regarima = ARIMA(confirmed ~ distance_measures))
 
 new_data <- train_ts %>%
-  filter(date == max(date) - days(period)) %>%
+  filter(date == max(date)) %>%
   inner_join(length_series, by = "country") %>%
   filter(length_series > 7 & ttl_distance_measures > 0) %>%
   as_tibble() %>%
@@ -909,50 +1267,59 @@ new_data <- train_ts %>%
 
 
 new_data <- train_ts %>%
-              filter(date == max(date) - days(period)) %>%
+              filter(date == max(date)) %>%
               new_data(., period) %>%
               inner_join(new_data, by = "country")
 
 train_forecast_regarima <- train_model_regarima %>% forecast(new_data)
+write_csv(train_forecast_regarima, "data/train_forecast_regarima.csv")
 
 best_model_regarima <- train_forecast_regarima %>%
-                       fabletools::accuracy(train_ts) 
+                       fabletools::accuracy(test_ts) 
+
+perf_ts_model <- best_model_long %>%
+                 bind_rows(best_model_regarima)
 
 
-####################################################  
-
-# train_model_short <- train_ts %>%
-#   filter(Date <= max(Date) - days(period)) %>%
-#   inner_join(length_series, by = "country_id") %>%
-#   filter(length_series <= 7) %>%
-#   model(
-#     ETS = ETS(ConfirmedCases),
-#     ARIMA = ARIMA(ConfirmedCases),
-#     NAIVE = NAIVE(ConfirmedCases),
-#     SNAIVE = SNAIVE(ConfirmedCases)
-#   )
-
-
-
-# train_forecast_short <- train_model_short %>%  
-#                         forecast(h = paste0(period, " days"))
-
-# best_model_short<- train_forecast_short %>%
-#   fabletools::accuracy(train_ts) %>%
-#   arrange(country_id, RMSE) %>%
-#   group_by(country_id) %>%
-#   slice(1)
-
-best_model_cases <- best_model_long %>%
-                    #bind_rows(best_model_short) %>%
-                    bind_rows(best_model_regarima) %>%
+best_model_cases <-  perf_ts_model %>%
                     arrange(country, RMSE) %>%
                     group_by(country) %>%
                     slice(1)
 
-write.csv(best_model_cases, "train_performance.csv", row.names = FALSE)
+
+train_forecast_long %>% 
+as_tibble() %>%  
+bind_rows(train_forecast_regarima %>% as_tibble()) %>%
+filter(.model ==  best_model_cases %>% filter(country == "Germany") %>% pull(.model)) %>% 
+bind_rows(test_ts %>% mutate(.model = "truth")) %>%
+  filter(country =="Germany") %>%
+ ggplot(aes(x = date, y = confirmed, color = .model)) + 
+ geom_line() + 
+  scale_color_tableau() +
+  ggtitle("Forecast Germany")
+
+
+train_forecast_long %>% 
+as_tibble() %>%  
+bind_rows(train_forecast_regarima %>% as_tibble()) %>%
+inner_join(best_model_cases, by = c("country", ".model")) %>%
+mutate(.model = "pred") %>%  
+bind_rows(test_ts %>% mutate(.model = "truth")) %>%
+group_by(date, .model) %>%
+summarise(confirmed = sum(confirmed)) %>%
+ggplot(aes(x = date , y = confirmed, color = .model))+
+geom_line() + 
+scale_color_tableau() + 
+ggtitle("Forecast world-wide Time Series")
+
+
+write.csv(perf_ts_model, "data/train_performance_ts.csv", row.names = FALSE)
 } else {
-best_model_cases <- read.csv("train_performance.csv", stringsAsFactors = FALSE)
+perf_ts_model <- read.csv("data/train_performance_ts.csv", stringsAsFactors = FALSE)
+best_model_cases <-  perf_ts_model %>%
+                    arrange(country, RMSE) %>%
+                    group_by(country) %>%
+                    slice(1)
 }
 best_model_cases %>% ggplot(aes(x = MAE)) + 
                     geom_histogram(bins = 50) +
@@ -964,15 +1331,23 @@ best_model_cases %>% ggplot(aes(x = MAPE)) +
 
 best_model_cases %>% ggplot(aes(x = .model)) + geom_bar()
                     
-#fit all models on whole dataset and forecast number of days in test set
-period <-  as.numeric(difftime(max(test$date), min(test$date), units = "days")) + 1 
+#fit all models on whole dataset and forecast 14days ahead
+period <-  14
+
+full_data <- train %>%
+                        bind_rows(test) %>%
+                        select(country, date, confirmed, distance_measures) %>%
+                        as_tsibble(
+                        index = date,
+                        key = country
+                        )
 
 pred_best_model_ts <- function(x, target = "confirmed"){
 model_country <- best_model_cases %>% filter(.model == x) %>% pull(country)
 #log models
   if(str_detect("ETS_LOG","LOG")){
     x <- str_replace(x,"_LOG","")
-      model <- train_ts %>%
+      model <- full_data %>%
         filter(country %in% model_country ) %>%
         model(x = eval(parse(text = x))(log(!! sym(target) + 1))) %>% 
         forecast(h = paste0(period, " days")) %>%
@@ -980,7 +1355,7 @@ model_country <- best_model_cases %>% filter(.model == x) %>% pull(country)
         mutate(.model = x) %>%
         select(1 : 4)
   } else {
-        model <- train_ts %>%
+        model <- full_data %>%
         filter(country %in% model_country ) %>%
         model(x = eval(parse(text = x))(!! sym(target))) %>% 
         forecast(h = paste0(period, " days")) %>%
@@ -1000,18 +1375,18 @@ regarima_coutries <- best_model_cases %>%
                       filter(.model =="regarima") %>%
                       pull(country)
 
-train_model_regarima <- train_ts %>%
+train_model_regarima <- full_data %>%
                         filter(country %in% regarima_coutries) %>%
-                        model(regarima = ARIMA(ConfirmedCases ~ distance_measures))
+                        model(regarima = ARIMA(confirmed ~ distance_measures))
 
 
-new_data <- train_ts %>%
+new_data <- full_data %>%
   filter(date == max(date) & country %in% regarima_coutries) %>%
   as_tibble() %>%
   select(country, distance_measures)
 
 
-new_data <- train_ts %>%
+new_data <- full_data %>%
               filter(date == max(date)) %>%
               new_data(., period) %>%
               inner_join(new_data, by = "country")
@@ -1027,22 +1402,53 @@ regarima_pred <- train_model_regarima %>%
   
 final_pred <-  final_pred %>% 
                 bind_rows(regarima_pred)
-    write.csv(final_pred, "prediction_ts_confirmedcases.csv", row.names = FALSE)
+    write.csv(final_pred, "data/prediction_ts_confirmedcases.csv", row.names = FALSE)
 } else {
- final_pred_cases <- read_csv("prediction_ts_confirmedcases.csv")
+ final_pred <- read_csv("data/prediction_ts_confirmedcases.csv")
 }
 
+final_pred %>% 
+filter(country == "Germany") %>%
+ggplot(aes(x = date, y = confirmed)) + 
+geom_line() +
+ggtitle(" 14-Days Forecast Germany")
+
+final_pred %>% 
+group_by(date) %>%
+summarise(confirmed = sum(confirmed)) %>%
+ggplot(aes(x = date, y = confirmed)) + 
+geom_line() +
+ggtitle(" 14-Days Forecast word-wide")
+  
 
 ```
 
 # Model Comparison
 ```{r}
-
-best_model_cases <- best_model_cases %>% 
+model_performance <- perf_ts_model %>% 
                     bind_rows(perf_ml_cases_recursive) %>%
+                    bind_rows(performance_direct)
+
+model_performance %>%
+  ggplot(aes(y = RMSE, x =fct_reorder(.model, RMSE, .desc=TRUE))) + 
+  geom_boxplot() + 
+  scale_y_log10()  +
+  ggtitle("Performance by Model") +
+  xlab("")
+
+
+best_model_cases <- model_performance %>%
                     arrange(country, RMSE) %>%
                     group_by(country) %>%
                     slice(1)
+best_model_cases %>% 
+  mutate(.model = "best_model") %>%
+  bind_rows(model_performance) %>%
+  ggplot(aes(y = RMSE, x =fct_reorder(.model, RMSE, .desc=TRUE))) + 
+  geom_boxplot() + 
+  scale_y_log10()  +
+  ggtitle("Improvement of Using different Models") +
+  xlab("")
 
 best_model_cases %>% 
   ggplot(aes(x = .model)) +
@@ -1051,7 +1457,7 @@ best_model_cases %>%
 
 
 ```
-# Submission
+# Choose Best Prediction and Plot
 ```{r}
 # Confirmed Cases
 best_ts_cases <- final_pred_cases %>%
@@ -1094,3 +1500,4 @@ submission <- test %>% select(ForecastId, country_id, Date) %>%
 write.csv(submission, "final_pred.csv", row.names = FALSE)
 
 ```
+
