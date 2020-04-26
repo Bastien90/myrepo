@@ -33,6 +33,8 @@ library(zoo)
 library(anomalize)
 library(vip)
 library(tidycovid19)
+library(usethis)
+use_git_config(user.name = "Bastien90", user.email = "bastienhaller@web.de")
 
 theme_set(theme_minimal())
 
@@ -1604,7 +1606,7 @@ final_pred <- final_pred %>%
 model_history <- model_history %>%
                  bind_rows(final_pred)
 
-# write_csv(model_history, "data/model_history.csv")
+write_csv(model_history, "data/model_history.csv")
 
 ```
 
