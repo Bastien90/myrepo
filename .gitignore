@@ -1,0 +1,8 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+covid.Rproj
+data/
+models/
+data/covid19.csv
