@@ -1,6 +1,8 @@
 ---
 title: "Covid 19 Forecast"
-output: html_document
+output: 
+  html_document:
+    keep_md: true
 editor_options: 
   chunk_output_type: console
 ---
@@ -753,6 +755,7 @@ xgboost_grid
 
 #train a challenger model once a week
 train_challenger <- wday(today(), week_start = 1) == 1
+train_challenger <- FALSE
  if(train_challenger){
   #xgboost – Hyperparameter Tuning
   challenger_tune <- tune_grid(log_cases ~ .,
