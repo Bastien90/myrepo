@@ -36,6 +36,7 @@ library(anomalize)
 library(vip)
 library(tidycovid19)
 library(usethis)
+library(htmltools)
 use_git_config(user.name = "Bastien90", user.email = "bastienhaller@web.de")
 
 theme_set(theme_minimal())
@@ -113,7 +114,8 @@ test <- test %>%
 
 
 train %>% filter(confirmed > 0) %>%
-hchart(., "line", hcaes(x = days_since_first_case, y = confirmed, group = country))
+hchart(., "line", hcaes(x = days_since_first_case, y = confirmed, group = country)) %>%
+htmltools::tagList(.)  
 
 #WDI Data
 if(!file.exists("data/wdi_dat.csv")){
