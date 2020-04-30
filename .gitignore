@@ -6,3 +6,4 @@ covid.Rproj
 data/
 models/
 data/covid19.csv
+LightGBM/

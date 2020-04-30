@@ -42,8 +42,9 @@ use_git_config(user.name = "Bastien90", user.email = "bastienhaller@web.de")
 theme_set(theme_minimal())
 
 #setting parameters
-sub_set <- TRUE # only train on subset of the data
-retrain_ts <- FALSE # retrain time series models
+sub_set <- FALSE # only train on subset of the data
+retrain_ts <- TRUE # retrain time series models#
+train_challenger <- FALSE #train a challenger model once a week
 
 covid <- read_csv("data/covid19.csv")
 
@@ -115,6 +116,7 @@ test <- test %>%
 
 train %>% filter(confirmed > 0) %>%
 hchart(., "line", hcaes(x = days_since_first_case, y = confirmed, group = country)) %>%
+list() %>%
 htmltools::tagList(.)  
 
 #WDI Data
@@ -489,7 +491,7 @@ filter(country == "Germany") %>%
   ggtitle("SIR Process Germany")
 
 sir %>%
-  group_by(date) %>%
+  group_by(day) %>%
   summarise_if(is.numeric, sum) %>%
   ggplot(aes(x = day )) +
 geom_line(aes(y = susceptible, color = "susceptible"), size = 1) +
@@ -505,7 +507,7 @@ geom_line(aes(y = resistant, color = "resistant"), size = 1) +
    labels = trans_format("log10", math_format(10^.x)))
 
 sir %>%
-  group_by(date) %>%
+  group_by(day) %>%
   summarise_if(is.numeric, sum) %>%
     ggplot(aes(x = day )) +
   geom_line(aes(y = confirmed, color = "Total Cases"), size = 1) +
@@ -704,7 +706,7 @@ training_set <-  train_lagged  %>%
 
 #show Folds for training (Date Column is required)
 n_countries <- train_lagged %>% distinct(country) %>% nrow()
-init <- 35
+init <- 42
 rolling_folds <- train_lagged  %>%
                  rolling_origin(.,
                                 initial =  init * n_countries,
@@ -756,8 +758,7 @@ xgboost_grid <- grid_max_entropy(xgboost_params, size = 30)
 xgboost_grid
 
 #train a challenger model once a week
-train_challenger <- wday(today(), week_start = 1) == 1
-train_challenger <- FALSE
+
  if(train_challenger){
   #xgboost – Hyperparameter Tuning
   challenger_tune <- tune_grid(log_cases ~ .,
@@ -899,7 +900,7 @@ perf_ml_cases_recursive %>%
 
     cases_pred_challenger <- recursive_pred(challenger_fit)
 
-   mae_orig_model <- cases_pred_ml %>%
+   mae_orig_model <- cases_pred_ml_test %>%
    reg_metrics(truth = confirmed, estimate = pred_confirmed) %>%
    mutate(.metric = toupper(.metric),
    .model = "recursive_xgb") %>%
@@ -1626,8 +1627,8 @@ model_performance_hist <- model_history %>%
 model_performance_hist %>%
   filter(country == "Germany") %>%
   ggplot(aes(x = date)) +
-  geom_point(aes(y = confirmed, color = "truth"), size = 1) +
-  geom_point(aes(y = pred_confirmed, color = "forecast"), size = 1) +
+  geom_line(aes(y = confirmed, color = "truth"), size = 1) +
+  geom_line(aes(y = pred_confirmed, color = "forecast"), size = 1) +
   scale_color_manual(values = c(
     'truth' = 'darkorange',
     'forecast' = 'darkblue')) +
@@ -1641,8 +1642,8 @@ model_performance_hist %>%
   summarise(confirmed = sum(confirmed),
             pred_confirmed = sum(pred_confirmed)) %>%
   ggplot(aes(x = date)) +
-  geom_point(aes(y = confirmed, color = "truth"), size = 1) +
-  geom_point(aes(y = pred_confirmed, color = "forecast"), size = 1) +
+  geom_line(aes(y = confirmed, color = "truth"), size = 1) +
+  geom_line(aes(y = pred_confirmed, color = "forecast"), size = 1) +
   scale_color_manual(values = c(
     'truth' = 'darkorange',
     'forecast' = 'darkblue')) +
